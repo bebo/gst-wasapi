@@ -32,11 +32,6 @@ if errorlevel 1 (
   exit /b %errorlevel%
 )
 
-xcopy third_party\obs-binaries\* dist\
-if errorlevel 1 (
-  exit /b %errorlevel%
-)
-
 set FILENAME=gst-wasapi_%TAG%.zip
 
 "C:\Program Files\7-Zip\7z.exe" a -r %FILENAME% -w .\dist\* -mem=AES256
