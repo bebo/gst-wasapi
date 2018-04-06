@@ -20,6 +20,8 @@
 #ifndef __GST_WASAPI_UTIL_H__
 #define __GST_WASAPI_UTIL_H__
 
+#define COBJMACROS
+
 #include <gst/gst.h>
 #include <gst/audio/audio.h>
 #include <gst/audio/gstaudiosrc.h>
