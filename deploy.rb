@@ -3,11 +3,16 @@
 
 require 'optparse'
 require 'open3'
-require 'rbconfig' 
-
+require 'rbconfig'
 include Open3
 
-JENKINS_URL = "https://usw1-jenkins-002.blab.im/job/gst-wasapi/"
+JENKINS_HOST = 'usw1-jenkins-002.blab.im'
+JENKINS_PROJECT = 'gst-wasapi'
+
+
+JENKINS_URL = "https://#{JENKINS_HOST}/job/#{JENKINS_PROJECT}/"
+JENKINS_TOKEN = 'uBC3kFJF'
+
 IS_WINDOWS = (RbConfig::CONFIG['host_os'] =~ /mswin|mingw|cygwin/)
 
 curl = IS_WINDOWS ? "./third_party/curl/bin/curl.exe -L --write-out %{http_code}" : "curl -s --write-out %{http_code}"
@@ -41,8 +46,10 @@ end
 
 #ARGV << '-h' if ARGV.empty?
 
-# env, tag, deploy, hosts
+# env, tag, deploy
 # get options
+#
+
 options = {}
 OptionParser.new do |opts|
   opts.banner = "Usage: deploy.rb [options]"
@@ -57,18 +64,15 @@ OptionParser.new do |opts|
       options[:dryrun] = n
   end
   options[:environment] = "dev"
-  opts.on("-e", "--env ENV", "Environment to deploy to: dev, prod, local") do |e|
+  opts.on("-e", "--env ENV", "Environment to deploy to: dev, prod, ptr") do |e|
       options[:environment] = e
   end
   opts.on("-t", "--tag TAG", "tag to deploy") do |t|
       options[:tag] = t
   end
-  options[:upload] = true
-  opts.on("-u", "--[no-]upload", "upload to s3") do |d|
-      options[:deploy] = d
-  end
-  opts.on("-l", "--[no-]live", "make live as latest & for auto-update") do |l|
-      options[:live ] = l
+  options[:live] = false
+  opts.on("-l", "--live", "live or not") do |l|
+      options[:live] = l
   end
   opts.on_tail("-h", "--help", "Show this message") do
     puts opts
@@ -117,7 +121,7 @@ unless options[:dryrun]
 end
 
 # trigger new build
-jenkins_build_url="#{JENKINS_URL}buildWithParameters?token=uBC3kFJF&ENV=#{options[:environment]}&TAG=#{new_tag}&UPLOAD=#{options[:upload]}"
+jenkins_build_url="#{JENKINS_URL}buildWithParameters?token=#{JENKINS_TOKEN}&ENV=#{options[:environment]}&TAG=#{new_tag}&LIVE=#{options[:live]}"
 
 if options[:live]
     jenkins_build_url += "&LIVE=#{options[:live]}"
