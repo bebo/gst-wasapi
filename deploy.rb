@@ -123,9 +123,6 @@ end
 # trigger new build
 jenkins_build_url="#{JENKINS_URL}buildWithParameters?token=#{JENKINS_TOKEN}&ENV=#{options[:environment]}&TAG=#{new_tag}&LIVE=#{options[:live]}"
 
-if options[:live]
-    jenkins_build_url += "&LIVE=#{options[:live]}"
-end
 puts "#{jenkins_build_url}"
 
 puts "jenkins url: #{jenkins_build_url}" if options[:verbose]
