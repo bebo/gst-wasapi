@@ -39,7 +39,7 @@
  *
  */
 #ifdef HAVE_CONFIG_H
-#  include "config.h"
+#  include <config.h>
 #endif
 
 #include "gstwasapisink.h"
@@ -141,7 +141,8 @@ gst_wasapi_sink_class_init (GstWasapiSinkClass * klass)
   g_object_class_install_property (gobject_class,
       PROP_AUDIOCLIENT3,
       g_param_spec_boolean ("use-audioclient3", "Use the AudioClient3 API",
-          "Use the Windows 10 AudioClient3 API when available",
+          "Use the Windows 10 AudioClient3 API when available and if the "
+          "low-latency property is set to TRUE",
           DEFAULT_AUDIOCLIENT3, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   gst_element_class_add_static_pad_template (gstelement_class, &sink_template);
@@ -174,6 +175,7 @@ gst_wasapi_sink_init (GstWasapiSink * self)
   self->low_latency = DEFAULT_LOW_LATENCY;
   self->try_audioclient3 = DEFAULT_AUDIOCLIENT3;
   self->event_handle = CreateEvent (NULL, FALSE, FALSE, NULL);
+  self->client_needs_restart = FALSE;
 
   CoInitialize (NULL);
 }
@@ -295,10 +297,30 @@ gst_wasapi_sink_get_property (GObject * object, guint prop_id,
 static gboolean
 gst_wasapi_sink_can_audioclient3 (GstWasapiSink * self)
 {
-  if (self->sharemode == AUDCLNT_SHAREMODE_SHARED &&
-      self->try_audioclient3 && gst_wasapi_util_have_audioclient3 ())
-    return TRUE;
-  return FALSE;
+  /* AudioClient3 API only makes sense in shared mode */
+  if (self->sharemode != AUDCLNT_SHAREMODE_SHARED)
+    return FALSE;
+
+  if (!self->try_audioclient3) {
+    GST_INFO_OBJECT (self, "AudioClient3 disabled by user");
+    return FALSE;
+  }
+
+  if (!gst_wasapi_util_have_audioclient3 ()) {
+    GST_INFO_OBJECT (self, "AudioClient3 not available on this OS");
+    return FALSE;
+  }
+
+  /* Only use audioclient3 when low-latency is requested because otherwise
+   * very slow machines and VMs with 1 CPU allocated will get glitches:
+   * https://bugzilla.gnome.org/show_bug.cgi?id=794497 */
+  if (!self->low_latency) {
+    GST_INFO_OBJECT (self, "AudioClient3 disabled because low-latency mode "
+        "was not requested");
+    return FALSE;
+  }
+
+  return TRUE;
 }
 
 static GstCaps *
@@ -318,22 +340,26 @@ gst_wasapi_sink_get_caps (GstBaseSink * bsink, GstCaps * filter)
 
     template_caps = gst_pad_get_pad_template_caps (bsink->sinkpad);
 
-    if (!self->client)
-      gst_wasapi_sink_open (GST_AUDIO_SINK (bsink));
+    if (!self->client) {
+      caps = template_caps;
+      goto out;
+    }
 
     ret = gst_wasapi_util_get_device_format (GST_ELEMENT (self),
         self->sharemode, self->device, self->client, &format);
     if (!ret) {
       GST_ELEMENT_ERROR (self, STREAM, FORMAT, (NULL),
           ("failed to detect format"));
-      goto out;
+      gst_caps_unref (template_caps);
+      return NULL;
     }
 
     gst_wasapi_util_parse_waveformatex ((WAVEFORMATEXTENSIBLE *) format,
         template_caps, &caps, &self->positions);
     if (caps == NULL) {
       GST_ELEMENT_ERROR (self, STREAM, FORMAT, (NULL), ("unknown format"));
-      goto out;
+      gst_caps_unref (template_caps);
+      return NULL;
     }
 
     {
@@ -355,9 +381,8 @@ gst_wasapi_sink_get_caps (GstBaseSink * bsink, GstCaps * filter)
     caps = filtered;
   }
 
-  GST_DEBUG_OBJECT (self, "returning caps %" GST_PTR_FORMAT, caps);
-
 out:
+  GST_DEBUG_OBJECT (self, "returning caps %" GST_PTR_FORMAT, caps);
   return caps;
 }
 
@@ -448,6 +473,8 @@ gst_wasapi_sink_prepare (GstAudioSink * asink, GstAudioRingBufferSpec * spec)
   REFERENCE_TIME latency_rt;
   guint bpf, rate, devicep_frames;
   HRESULT hr;
+
+  CoInitialize (NULL);
 
   if (gst_wasapi_sink_can_audioclient3 (self)) {
     if (!gst_wasapi_util_initialize_audioclient3 (GST_ELEMENT (self), spec,
@@ -552,9 +579,7 @@ gst_wasapi_sink_unprepare (GstAudioSink * asink)
 {
   GstWasapiSink *self = GST_WASAPI_SINK (asink);
 
-  if (self->sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE &&
-      !gst_wasapi_sink_can_audioclient3 (self))
-    CoUninitialize ();
+  CoUninitialize ();
 
   if (self->thread_priority_handle != NULL) {
     gst_wasapi_util_revert_thread_characteristics
@@ -571,6 +596,8 @@ gst_wasapi_sink_unprepare (GstAudioSink * asink)
     self->render_client = NULL;
   }
 
+  CoUninitialize ();
+
   return TRUE;
 }
 
@@ -582,10 +609,25 @@ gst_wasapi_sink_write (GstAudioSink * asink, gpointer data, guint length)
   gint16 *dst = NULL;
   guint pending = length;
 
+  GST_OBJECT_LOCK (self);
+  if (self->client_needs_restart) {
+    hr = IAudioClient_Start (self->client);
+    HR_FAILED_AND (hr, IAudioClient::Start, length = 0; goto beach);
+    self->client_needs_restart = FALSE;
+  }
+  GST_OBJECT_UNLOCK (self);
+
   while (pending > 0) {
+    DWORD dwWaitResult;
     guint can_frames, have_frames, n_frames, write_len;
 
-    WaitForSingleObject (self->event_handle, INFINITE);
+    dwWaitResult = WaitForSingleObject (self->event_handle, INFINITE);
+    if (dwWaitResult != WAIT_OBJECT_0) {
+      GST_ERROR_OBJECT (self, "Error waiting for event handle: %x",
+          (guint) dwWaitResult);
+      length -= pending;
+      goto beach;
+    }
 
     /* We have N frames to be written out */
     have_frames = pending / (self->mix_format->nBlockAlign);
@@ -637,12 +679,18 @@ gst_wasapi_sink_reset (GstAudioSink * asink)
   GstWasapiSink *self = GST_WASAPI_SINK (asink);
   HRESULT hr;
 
+  GST_INFO_OBJECT (self, "reset called");
+
   if (!self->client)
     return;
 
+  GST_OBJECT_LOCK (self);
   hr = IAudioClient_Stop (self->client);
-  HR_FAILED_RET (hr, IAudioClient::Stop,);
+  HR_FAILED_AND (hr, IAudioClient::Stop,);
 
   hr = IAudioClient_Reset (self->client);
-  HR_FAILED_RET (hr, IAudioClient::Reset,);
+  HR_FAILED_AND (hr, IAudioClient::Reset,);
+
+  self->client_needs_restart = TRUE;
+  GST_OBJECT_UNLOCK (self);
 }

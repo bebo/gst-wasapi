@@ -37,7 +37,7 @@
  *
  */
 #ifdef HAVE_CONFIG_H
-#  include "config.h"
+#  include <config.h>
 #endif
 
 #include "gstwasapisrc.h"
@@ -57,6 +57,9 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
 #define DEFAULT_EXCLUSIVE     FALSE
 #define DEFAULT_LOW_LATENCY   FALSE
 #define DEFAULT_AUDIOCLIENT3  FALSE
+/* The clock provided by WASAPI is always off and causes buffers to be late
+ * very quickly on the sink. Disable pending further investigation. */
+#define DEFAULT_PROVIDE_CLOCK FALSE
 
 enum
 {
@@ -88,8 +91,10 @@ static guint gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data,
 static guint gst_wasapi_src_delay (GstAudioSrc * asrc);
 static void gst_wasapi_src_reset (GstAudioSrc * asrc);
 
+#ifdef DEFAULT_PROVIDE_CLOCK
 static GstClockTime gst_wasapi_src_get_time (GstClock * clock,
     gpointer user_data);
+#endif
 
 #define gst_wasapi_src_parent_class parent_class
 G_DEFINE_TYPE (GstWasapiSrc, gst_wasapi_src, GST_TYPE_AUDIO_SRC);
@@ -168,6 +173,7 @@ gst_wasapi_src_class_init (GstWasapiSrcClass * klass)
 static void
 gst_wasapi_src_init (GstWasapiSrc * self)
 {
+#ifdef DEFAULT_PROVIDE_CLOCK
   /* override with a custom clock */
   if (GST_AUDIO_BASE_SRC (self)->clock)
     gst_object_unref (GST_AUDIO_BASE_SRC (self)->clock);
@@ -175,6 +181,7 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   GST_AUDIO_BASE_SRC (self)->clock = gst_audio_clock_new ("GstWasapiSrcClock",
       gst_wasapi_src_get_time, gst_object_ref (self),
       (GDestroyNotify) gst_object_unref);
+#endif
 
   self->role = DEFAULT_ROLE;
   self->sharemode = AUDCLNT_SHAREMODE_SHARED;
@@ -182,6 +189,7 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->low_latency = DEFAULT_LOW_LATENCY;
   self->try_audioclient3 = DEFAULT_AUDIOCLIENT3;
   self->event_handle = CreateEvent (NULL, FALSE, FALSE, NULL);
+  self->client_needs_restart = FALSE;
 
   CoInitialize (NULL);
 }
@@ -326,22 +334,26 @@ gst_wasapi_src_get_caps (GstBaseSrc * bsrc, GstCaps * filter)
 
     template_caps = gst_pad_get_pad_template_caps (bsrc->srcpad);
 
-    if (!self->client)
-      gst_wasapi_src_open (GST_AUDIO_SRC (bsrc));
+    if (!self->client) {
+      caps = template_caps;
+      goto out;
+    }
 
     ret = gst_wasapi_util_get_device_format (GST_ELEMENT (self),
         self->sharemode, self->device, self->client, &format);
     if (!ret) {
       GST_ELEMENT_ERROR (self, STREAM, FORMAT, (NULL),
           ("failed to detect format"));
-      goto out;
+      gst_caps_unref (template_caps);
+      return NULL;
     }
 
     gst_wasapi_util_parse_waveformatex ((WAVEFORMATEXTENSIBLE *) format,
         template_caps, &caps, &self->positions);
     if (caps == NULL) {
       GST_ELEMENT_ERROR (self, STREAM, FORMAT, (NULL), ("unknown format"));
-      goto out;
+      gst_caps_unref (template_caps);
+      return NULL;
     }
 
     {
@@ -363,9 +375,8 @@ gst_wasapi_src_get_caps (GstBaseSrc * bsrc, GstCaps * filter)
     caps = filtered;
   }
 
-  GST_DEBUG_OBJECT (self, "returning caps %" GST_PTR_FORMAT, caps);
-
 out:
+  GST_DEBUG_OBJECT (self, "returning caps %" GST_PTR_FORMAT, caps);
   return caps;
 }
 
@@ -432,6 +443,8 @@ gst_wasapi_src_prepare (GstAudioSrc * asrc, GstAudioRingBufferSpec * spec)
   guint bpf, rate, devicep_frames, buffer_frames;
   HRESULT hr;
 
+  CoInitialize (NULL);
+
   if (gst_wasapi_src_can_audioclient3 (self)) {
     if (!gst_wasapi_util_initialize_audioclient3 (GST_ELEMENT (self), spec,
             (IAudioClient3 *) self->client, self->mix_format, self->low_latency,
@@ -483,6 +496,9 @@ gst_wasapi_src_prepare (GstAudioSrc * asrc, GstAudioRingBufferSpec * spec)
   hr = IAudioClock_GetFrequency (self->client_clock, &self->client_clock_freq);
   HR_FAILED_GOTO (hr, IAudioClock::GetFrequency, beach);
 
+  GST_INFO_OBJECT (self, "wasapi clock freq is %" G_GUINT64_FORMAT,
+      self->client_clock_freq);
+
   /* Get capture source client and start it up */
   if (!gst_wasapi_util_get_capture_client (GST_ELEMENT (self), self->client,
           &self->capture_client)) {
@@ -513,10 +529,6 @@ gst_wasapi_src_unprepare (GstAudioSrc * asrc)
 {
   GstWasapiSrc *self = GST_WASAPI_SRC (asrc);
 
-  if (self->sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE &&
-      !gst_wasapi_src_can_audioclient3 (self))
-    CoUninitialize ();
-
   if (self->thread_priority_handle != NULL) {
     gst_wasapi_util_revert_thread_characteristics
         (self->thread_priority_handle);
@@ -539,6 +551,8 @@ gst_wasapi_src_unprepare (GstAudioSrc * asrc)
 
   self->client_clock_freq = 0;
 
+  CoUninitialize ();
+
   return TRUE;
 }
 
@@ -552,11 +566,26 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
   guint wanted = length;
   DWORD flags;
 
+  GST_OBJECT_LOCK (self);
+  if (self->client_needs_restart) {
+    hr = IAudioClient_Start (self->client);
+    HR_FAILED_AND (hr, IAudioClient::Start, length = 0; goto beach);
+    self->client_needs_restart = FALSE;
+  }
+  GST_OBJECT_UNLOCK (self);
+
   while (wanted > 0) {
+    DWORD dwWaitResult;
     guint have_frames, n_frames, want_frames, read_len;
 
     /* Wait for data to become available */
-    WaitForSingleObject (self->event_handle, INFINITE);
+    dwWaitResult = WaitForSingleObject (self->event_handle, INFINITE);
+    if (dwWaitResult != WAIT_OBJECT_0) {
+      GST_ERROR_OBJECT (self, "Error waiting for event handle: %x",
+          (guint) dwWaitResult);
+      length = 0;
+      goto beach;
+    }
 
     hr = IAudioCaptureClient_GetBuffer (self->capture_client,
         (BYTE **) & from, &have_frames, &flags, NULL, NULL);
@@ -638,13 +667,18 @@ gst_wasapi_src_reset (GstAudioSrc * asrc)
   if (!self->client)
     return;
 
+  GST_OBJECT_LOCK (self);
   hr = IAudioClient_Stop (self->client);
   HR_FAILED_RET (hr, IAudioClock::Stop,);
 
   hr = IAudioClient_Reset (self->client);
   HR_FAILED_RET (hr, IAudioClock::Reset,);
+
+  self->client_needs_restart = TRUE;
+  GST_OBJECT_UNLOCK (self);
 }
 
+#ifdef DEFAULT_PROVIDE_CLOCK
 static GstClockTime
 gst_wasapi_src_get_time (GstClock * clock, gpointer user_data)
 {
@@ -671,3 +705,4 @@ gst_wasapi_src_get_time (GstClock * clock, gpointer user_data)
 
   return result;
 }
+#endif
