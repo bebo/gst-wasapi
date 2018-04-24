@@ -728,11 +728,28 @@ gst_wasapi_util_waveformatex_to_channel_mask (WAVEFORMATEXTENSIBLE * format,
   }
 
   /* Map WASAPI's channel mask to Gstreamer's channel mask and positions.
-   * If the no. of bits in the mask > nChannels, we will ignore the extra. */
+   * If the no. of bits in the mask > nChannels, we will ignore the extra.
+   *
+   * KSAUDIO_SPEAKER_7POINT1_SURROUND, 8 channels has different mapping
+   * than the regular KSAUDIO_SPEAKER_7POINT1, so we have a special case to
+   * handle diverged mapping. */
   for (ii = 0; ii < nChannels; ii++) {
-    if (!(dwChannelMask & wasapi_to_gst_pos[ii].wasapi_pos))
-      /* Non-positional or unknown position, warn? */
-      continue;
+    if (!(dwChannelMask & wasapi_to_gst_pos[ii].wasapi_pos)) {
+      gboolean is_valid_diverge_mapping = FALSE;
+
+      if ((dwChannelMask & KSAUDIO_SPEAKER_7POINT1_SURROUND) &&
+        (dwChannelMask & wasapi_to_gst_pos[ii + 3].wasapi_pos)) {
+        is_valid_diverge_mapping = TRUE;
+      } else if ((dwChannelMask & KSAUDIO_SPEAKER_5POINT1_SURROUND) &&
+        !(dwChannelMask & wasapi_to_gst_pos[ii + 6].wasapi_pos)) {
+        is_valid_diverge_mapping = TRUE;
+      }
+
+      if (!is_valid_diverge_mapping) {
+        /* Non-positional or unknown position, warn? */
+        continue;
+      }
+    }
     mask |= G_GUINT64_CONSTANT (1) << wasapi_to_gst_pos[ii].gst_pos;
     pos[ii] = wasapi_to_gst_pos[ii].gst_pos;
   }
