@@ -741,7 +741,7 @@ gst_wasapi_util_waveformatex_to_channel_mask (WAVEFORMATEXTENSIBLE * format,
         (dwChannelMask & wasapi_to_gst_pos[ii + 3].wasapi_pos)) {
         is_valid_diverge_mapping = TRUE;
       } else if ((dwChannelMask & KSAUDIO_SPEAKER_5POINT1_SURROUND) &&
-        !(dwChannelMask & wasapi_to_gst_pos[ii + 6].wasapi_pos)) {
+        (dwChannelMask & wasapi_to_gst_pos[ii + 6].wasapi_pos)) {
         is_valid_diverge_mapping = TRUE;
       }
 
