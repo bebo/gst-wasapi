@@ -737,11 +737,27 @@ gst_wasapi_util_waveformatex_to_channel_mask (WAVEFORMATEXTENSIBLE * format,
     if (!(dwChannelMask & wasapi_to_gst_pos[ii].wasapi_pos)) {
       gboolean is_valid_diverge_mapping = FALSE;
 
-      if ((dwChannelMask & KSAUDIO_SPEAKER_7POINT1_SURROUND) &&
-        (dwChannelMask & wasapi_to_gst_pos[ii + 3].wasapi_pos)) {
+      if ((dwChannelMask & KSAUDIO_SPEAKER_MONO) &&
+          (dwChannelMask & wasapi_to_gst_pos[ii + 2].wasapi_pos)) {
+        // SPEAKER_FRONT_CENTER
+        is_valid_diverge_mapping = TRUE;
+      } else if ((dwChannelMask & KSAUDIO_SPEAKER_QUAD) &&
+          (dwChannelMask & wasapi_to_gst_pos[ii + 2].wasapi_pos)) {
+        // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT
+        is_valid_diverge_mapping = TRUE;
+      } else if ((dwChannelMask & KSAUDIO_SPEAKER_SURROUND) &&
+          (dwChannelMask & wasapi_to_gst_pos[ii + 5].wasapi_pos)) {
+        // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_BACK_CENTER
         is_valid_diverge_mapping = TRUE;
       } else if ((dwChannelMask & KSAUDIO_SPEAKER_5POINT1_SURROUND) &&
-        (dwChannelMask & wasapi_to_gst_pos[ii + 6].wasapi_pos)) {
+          (dwChannelMask & wasapi_to_gst_pos[ii + 6].wasapi_pos)) {
+        // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY |
+        // SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT
+        is_valid_diverge_mapping = TRUE;
+      } else if ((dwChannelMask & KSAUDIO_SPEAKER_7POINT1_SURROUND) &&
+          (dwChannelMask & wasapi_to_gst_pos[ii + 3].wasapi_pos)) {
+        // SPEAKER_FRONT_LEFT | SPEAKER_FRONT_RIGHT | SPEAKER_FRONT_CENTER | SPEAKER_LOW_FREQUENCY |
+        // SPEAKER_BACK_LEFT | SPEAKER_BACK_RIGHT | SPEAKER_SIDE_LEFT | SPEAKER_SIDE_RIGHT
         is_valid_diverge_mapping = TRUE;
       }
 
