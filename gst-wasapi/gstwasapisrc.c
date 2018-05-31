@@ -189,6 +189,7 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->low_latency = DEFAULT_LOW_LATENCY;
   self->try_audioclient3 = DEFAULT_AUDIOCLIENT3;
   self->event_handle = CreateEvent (NULL, FALSE, FALSE, NULL);
+  self->stop_handle = CreateEvent (NULL, FALSE, FALSE, NULL);
   self->client_needs_restart = FALSE;
 
   CoInitialize (NULL);
@@ -202,6 +203,11 @@ gst_wasapi_src_dispose (GObject * object)
   if (self->event_handle != NULL) {
     CloseHandle (self->event_handle);
     self->event_handle = NULL;
+  }
+
+  if (self->stop_handle != NULL) {
+    CloseHandle (self->stop_handle);
+    self->stop_handle = NULL;
   }
 
   if (self->client_clock != NULL) {
@@ -580,12 +586,22 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
     guint have_frames, n_frames, want_frames, read_len;
 
     /* Wait for data to become available */
-    dwWaitResult = WaitForSingleObject (self->event_handle, INFINITE);
-    if (dwWaitResult != WAIT_OBJECT_0) {
-      GST_ERROR_OBJECT (self, "Error waiting for event handle: %x",
-          (guint) dwWaitResult);
-      length = 0;
-      goto beach;
+    HANDLE events[2] = {
+      self->event_handle,
+      self->stop_handle
+    };
+    dwWaitResult = WaitForMultipleObjects (2, events, FALSE, INFINITE);
+    switch (dwWaitResult) {
+      case WAIT_OBJECT_0:
+        break;
+      case WAIT_OBJECT_0 + 1: // Received a stop signal, going to fill data with silent
+        memset (data, 0, wanted);
+        goto beach;
+      default:
+        GST_ERROR_OBJECT (self, "Error waiting for event handle: %x",
+            (guint) dwWaitResult);
+        length = 0;
+        goto beach;
     }
 
     hr = IAudioCaptureClient_GetBuffer (self->capture_client,
@@ -664,6 +680,8 @@ gst_wasapi_src_reset (GstAudioSrc * asrc)
 {
   GstWasapiSrc *self = GST_WASAPI_SRC (asrc);
   HRESULT hr;
+
+  SetEvent (self->stop_handle);
 
   if (!self->client)
     return;
