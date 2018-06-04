@@ -191,6 +191,7 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->event_handle = CreateEvent (NULL, FALSE, FALSE, NULL);
   self->stop_handle = CreateEvent (NULL, FALSE, FALSE, NULL);
   self->client_needs_restart = FALSE;
+  self->capture_too_many_frames_log_count = 0;
 
   CoInitialize (NULL);
 }
@@ -557,6 +558,7 @@ gst_wasapi_src_unprepare (GstAudioSrc * asrc)
   }
 
   self->client_clock_freq = 0;
+  self->capture_too_many_frames_log_count = 0;
 
   CoUninitialize ();
 
@@ -633,9 +635,11 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
 
     /* If GetBuffer is returning more frames than we can handle, all we can do is
      * hope that this is temporary and that things will settle down later. */
-    if (G_UNLIKELY (have_frames > want_frames))
-      GST_WARNING_OBJECT (self, "captured too many frames: have %i, want %i",
-          have_frames, want_frames);
+    if (G_UNLIKELY(have_frames > want_frames) && 
+      self->capture_too_many_frames_log_count % 60000 == 0) {
+      GST_WARNING_OBJECT(self, "captured too many frames: have %i, want %i",
+        have_frames, want_frames);
+    }
 
     /* Only copy data that will fit into the allocated buffer of size @length */
     n_frames = MIN (have_frames, want_frames);
