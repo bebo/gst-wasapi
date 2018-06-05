@@ -637,6 +637,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
      * hope that this is temporary and that things will settle down later. */
     if (G_UNLIKELY(have_frames > want_frames) && 
       self->capture_too_many_frames_log_count % 60000 == 0) {
+      self->capture_too_many_frames_log_count++;
       GST_WARNING_OBJECT(self, "captured too many frames: have %i, want %i",
         have_frames, want_frames);
     }
