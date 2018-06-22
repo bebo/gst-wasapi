@@ -41,7 +41,6 @@
 #endif
 
 #include "gstwasapisrc.h"
-
 #include <avrt.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_wasapi_src_debug);
@@ -608,7 +607,10 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
 
     hr = IAudioCaptureClient_GetBuffer (self->capture_client,
         (BYTE **) & from, &have_frames, &flags, NULL, NULL);
-    if (hr != S_OK) {
+    if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+      goto device_disappeared; 
+    }
+    else if (hr != S_OK) {
       gchar *msg = gst_wasapi_util_hresult_to_string (hr);
       if (hr == AUDCLNT_S_BUFFER_EMPTY)
         GST_WARNING_OBJECT (self, "IAudioCaptureClient::GetBuffer failed: %s"
@@ -649,7 +651,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
 
     {
       guint bpf = self->mix_format->nBlockAlign;
-      GST_DEBUG_OBJECT (self, "have: %i (%i bytes), can read: %i (%i bytes), "
+      GST_LOG_OBJECT (self, "have: %i (%i bytes), can read: %i (%i bytes), "
           "will read: %i (%i bytes)", have_frames, have_frames * bpf,
           want_frames, wanted, n_frames, read_len);
     }
@@ -680,6 +682,13 @@ beach:
     }
   } 
   return length;
+device_disappeared:
+  {
+    GST_ELEMENT_ERROR(asrc, RESOURCE, READ,
+      ("Error recording from audio device. "
+        "The device has been disconnected."), (NULL));
+    return (guint)-1;
+  }
 }
 
 static guint
