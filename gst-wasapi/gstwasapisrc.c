@@ -664,7 +664,21 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
 
 
 beach:
-
+  // TODO: We need to properly buffer the results from GetBuffer because they return
+  // an arbitrary amount of audio samples.  However, if we never empty this thing out
+  // USB audio devices will glitch out after they fill up.  Right now, if there is 
+  // extra samples coming from the device we will just drop them.
+  // The guard is hr == S_OK because we don't want to try pulling frames if we came
+  // here because there was an error.
+  while (hr == S_OK) {
+    guint have_frames;
+    hr = IAudioCaptureClient_GetBuffer(self->capture_client,
+      (BYTE **)& from, &have_frames, &flags, NULL, NULL);
+    if (hr == S_OK) {
+      GST_WARNING("Buffer Not Empty. Dropping audio frames");
+      IAudioCaptureClient_ReleaseBuffer(self->capture_client, have_frames);
+    }
+  } 
   return length;
 }
 
