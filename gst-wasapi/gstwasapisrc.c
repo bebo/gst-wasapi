@@ -191,7 +191,8 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->stop_handle = CreateEvent (NULL, FALSE, FALSE, NULL);
   self->client_needs_restart = FALSE;
   self->capture_too_many_frames_log_count = 0;
-
+  self->change.default_changed = 0;
+  self->change_initialized = 0;
   CoInitialize (NULL);
 }
 
@@ -223,6 +224,14 @@ gst_wasapi_src_dispose (GObject * object)
   if (self->capture_client != NULL) {
     IUnknown_Release (self->capture_client);
     self->capture_client = NULL;
+  }
+
+  if (self->change_initialized && self->change.client.lpVtbl) {
+    change_notify * change = &self->change;
+    self->change_initialized = 0;
+    IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(
+      change->pEnumerator, (IMMNotificationClient *)change);
+    IUnknown_Release(change->pEnumerator);
   }
 
   G_OBJECT_CLASS (parent_class)->dispose (object);
@@ -413,7 +422,9 @@ gst_wasapi_src_open (GstAudioSrc * asrc)
           ("Failed to open device %S", self->device_strid));
     goto beach;
   }
-
+  if (!self->device_strid) {
+    gst_wasapi_util_initialize_notification_client(self);
+  }
   self->client = client;
   self->device = device;
   res = TRUE;
@@ -583,6 +594,9 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
   GST_OBJECT_UNLOCK (self);
 
   while (wanted > 0) {
+    if (!self->device_strid && g_atomic_int_get(&(self->change.default_changed))) {
+      goto device_disappeared;
+    }
     DWORD dwWaitResult;
     guint have_frames, n_frames, want_frames, read_len;
 
@@ -686,7 +700,8 @@ device_disappeared:
   {
     GST_ELEMENT_ERROR(asrc, RESOURCE, READ,
       ("Error recording from audio device. "
-        "The device has been disconnected."), (NULL));
+        "The device has been disconnected or "
+        "the default device has changed."), (NULL));
     return (guint)-1;
   }
 }

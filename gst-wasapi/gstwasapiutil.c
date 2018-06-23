@@ -24,6 +24,7 @@
 
 #include "gstwasapiutil.h"
 #include "gstwasapidevice.h"
+#include "gstwasapisrc.h"
 
 GST_DEBUG_CATEGORY_EXTERN (gst_wasapi_debug);
 #define GST_CAT_DEFAULT gst_wasapi_debug
@@ -72,6 +73,11 @@ const IID IID_IAudioCaptureClient = { 0xc8adbd64, 0xe71e, 0x48a0,
 
 const IID IID_IAudioRenderClient = { 0xf294acfc, 0x3146, 0x4483,
   {0xa7, 0xbf, 0xad, 0xdc, 0xa7, 0xc2, 0x60, 0xe2}
+};
+
+const IID IID_IMMNotificationClient = {
+  //MIDL_INTERFACE("7991EEC9-7E89-4D85-8390-6C703CEC60C0")
+  0x7991eec9, 0x7e89, 0x4d85,{ 0x83, 0x90, 0x6c, 0x70, 0x3c, 0xec, 0x60, 0xc0 }
 };
 
 /* *INDENT-OFF* */
@@ -540,6 +546,110 @@ out:
   *ret_format = format;
   return TRUE;
 }
+
+static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_QueryInterface(
+  IMMNotificationClient* This, REFIID riid, void **ppvObject)
+{
+  // Compatible with IMMNotificationClient and IUnknown
+  if (IsEqualGUID(&IID_IMMNotificationClient, riid) ||
+    IsEqualGUID(&IID_IUnknown, riid))
+  {
+    *ppvObject = (void *)This;
+    return S_OK;
+  }
+  else {
+    *ppvObject = NULL;
+    return E_NOINTERFACE;
+  }
+}
+
+// these are required, but not actually used
+static ULONG STDMETHODCALLTYPE sIMMNotificationClient_AddRef(
+  IMMNotificationClient *This)
+{
+  return 1;
+}
+
+// MSDN says it should free itself, but we're static
+static ULONG STDMETHODCALLTYPE sIMMNotificationClient_Release(
+  IMMNotificationClient *This)
+{
+  return 1;
+}
+
+static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnDeviceStateChanged(
+  IMMNotificationClient *This,
+  LPCWSTR pwstrDeviceId,
+  DWORD dwNewState)
+{
+  return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnDeviceAdded(
+  IMMNotificationClient *This,
+  LPCWSTR pwstrDeviceId)
+{
+  return S_OK;
+}
+
+// maybe MPV can go over to the preferred device once it is plugged in?
+static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnDeviceRemoved(
+  IMMNotificationClient *This,
+  LPCWSTR pwstrDeviceId)
+{
+  return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnDefaultDeviceChanged(
+  IMMNotificationClient *This,
+  EDataFlow flow,
+  ERole role,
+  LPCWSTR pwstrDeviceId)
+{
+  change_notify *change = (change_notify *)This;
+  GST_WARNING("DefaultDeviceChanged");
+  g_atomic_int_set(&change->default_changed, 1);
+  return S_OK;
+}
+
+static HRESULT STDMETHODCALLTYPE sIMMNotificationClient_OnPropertyValueChanged(
+  IMMNotificationClient *This,
+  LPCWSTR pwstrDeviceId,
+  const PROPERTYKEY key)
+{
+  return S_OK;
+}
+
+static CONST_VTBL IMMNotificationClientVtbl sIMMNotificationClientVtbl = {
+  .QueryInterface = sIMMNotificationClient_QueryInterface,
+  .AddRef = sIMMNotificationClient_AddRef,
+  .Release = sIMMNotificationClient_Release,
+  .OnDeviceStateChanged = sIMMNotificationClient_OnDeviceStateChanged,
+  .OnDeviceAdded = sIMMNotificationClient_OnDeviceAdded,
+  .OnDeviceRemoved = sIMMNotificationClient_OnDeviceRemoved,
+  .OnDefaultDeviceChanged = sIMMNotificationClient_OnDefaultDeviceChanged,
+  .OnPropertyValueChanged = sIMMNotificationClient_OnPropertyValueChanged,
+};
+
+gboolean
+gst_wasapi_util_initialize_notification_client(GstElement * element) {
+  GstWasapiSrc * self = element;
+  change_notify * change = &self->change;
+
+  HRESULT hr = CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_ALL,
+      &IID_IMMDeviceEnumerator,
+      (void **)&change->pEnumerator);
+  HR_FAILED_RET(hr, CoCreateInstance(MMDeviceEnumerator), FALSE);
+  change->client.lpVtbl = &sIMMNotificationClientVtbl;
+  hr = IMMDeviceEnumerator_RegisterEndpointNotificationCallback(
+    change->pEnumerator, (IMMNotificationClient *)change);
+  if (hr == S_OK) {
+    self->change_initialized = 1;
+    return TRUE;
+  }
+  return FALSE;
+}
+
 
 gboolean
 gst_wasapi_util_get_device_client (GstElement * self,

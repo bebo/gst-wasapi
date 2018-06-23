@@ -111,6 +111,8 @@ gboolean gst_wasapi_util_initialize_audioclient (GstElement * element,
     WAVEFORMATEX * format, guint sharemode, gboolean low_latency,
     gboolean loopback, guint * ret_devicep_frames);
 
+gboolean gst_wasapi_util_initialize_notification_client (GstElement * self);
+
 gboolean gst_wasapi_util_initialize_audioclient3 (GstElement * element,
     GstAudioRingBufferSpec * spec, IAudioClient3 * client,
     WAVEFORMATEX * format, gboolean low_latency, gboolean loopback,
