@@ -73,6 +73,7 @@ struct _GstWasapiSrc
   // Default Audio Device changed
   change_notify change;
   gint change_initialized;
+  gboolean eos_sent;
 
   /* properties */
   gint role;

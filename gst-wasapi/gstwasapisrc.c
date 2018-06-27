@@ -193,6 +193,7 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->capture_too_many_frames_log_count = 0;
   self->change.default_changed = 0;
   self->change_initialized = 0;
+  self->eos_sent = FALSE;
   CoInitialize (NULL);
 }
 
@@ -694,15 +695,22 @@ beach:
       GST_WARNING("Buffer Not Empty. Dropping audio frames");
       IAudioCaptureClient_ReleaseBuffer(self->capture_client, have_frames);
     }
-  } 
+  }
   return length;
 device_disappeared:
   {
-    GST_ELEMENT_ERROR(asrc, RESOURCE, READ,
-      ("Error recording from audio device. "
-        "The device has been disconnected or "
-        "the default device has changed."), (NULL));
-    return (guint)-1;
+    if (!self->eos_sent) {
+      GST_INFO_OBJECT(asrc, "The audio device has been disconnected.");
+      gboolean success = gst_element_post_message(GST_ELEMENT(self),
+        gst_message_new_element(GST_OBJECT(self),
+          gst_structure_new("wasapi_restart",
+            NULL)));
+      if (!success) {
+        GST_WARNING("Unable to send message");
+      }
+      self->eos_sent = TRUE;
+    }
+    return (guint) length;
   }
 }
 
