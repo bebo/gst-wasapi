@@ -68,7 +68,8 @@ enum
   PROP_LOOPBACK,
   PROP_EXCLUSIVE,
   PROP_LOW_LATENCY,
-  PROP_AUDIOCLIENT3
+  PROP_AUDIOCLIENT3,
+  PROP_RESTART_REQUIRED
 };
 
 static void gst_wasapi_src_dispose (GObject * object);
@@ -147,6 +148,12 @@ gst_wasapi_src_class_init (GstWasapiSrcClass * klass)
       g_param_spec_boolean ("use-audioclient3", "Use the AudioClient3 API",
           "Whether to use the Windows 10 AudioClient3 API when available",
           DEFAULT_AUDIOCLIENT3, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property(gobject_class,
+    PROP_RESTART_REQUIRED,
+    g_param_spec_boolean("restart-required", "Should we restart plugin",
+      "EOS signals don't work so we need to hack around this",
+      FALSE, G_PARAM_READABLE));
 
   gst_element_class_add_static_pad_template (gstelement_class, &src_template);
   gst_element_class_set_static_metadata (gstelement_class, "WasapiSrc",
@@ -318,6 +325,9 @@ gst_wasapi_src_get_property (GObject * object, guint prop_id,
       break;
     case PROP_AUDIOCLIENT3:
       g_value_set_boolean (value, self->try_audioclient3);
+      break;
+    case PROP_RESTART_REQUIRED:
+      g_value_set_boolean(value, self->eos_sent);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
