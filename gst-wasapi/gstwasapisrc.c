@@ -595,9 +595,6 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
   GST_OBJECT_UNLOCK (self);
 
   while (wanted > 0) {
-    if (!self->device_strid && g_atomic_int_get(&(self->change.default_changed))) {
-      goto device_disappeared;
-    }
     DWORD dwWaitResult;
     guint have_frames, n_frames, want_frames, read_len;
 
@@ -607,6 +604,9 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
       self->stop_handle
     };
     dwWaitResult = WaitForMultipleObjects (2, events, FALSE, INFINITE);
+    if (!self->device_strid && g_atomic_int_get(&(self->change.default_changed))) {
+      goto device_disappeared;
+    }
     switch (dwWaitResult) {
       case WAIT_OBJECT_0:
         break;
