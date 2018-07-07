@@ -697,6 +697,7 @@ beach:
   // extra samples coming from the device we will just drop them.
   // The guard is hr == S_OK because we don't want to try pulling frames if we came
   // here because there was an error.
+#if 0
   while (hr == S_OK) {
     guint have_frames;
     hr = IAudioCaptureClient_GetBuffer(self->capture_client,
@@ -706,6 +707,7 @@ beach:
       IAudioCaptureClient_ReleaseBuffer(self->capture_client, have_frames);
     }
   }
+#endif
   return length;
 device_disappeared:
   {
