@@ -19,7 +19,7 @@
  * Boston, MA 02110-1301, USA.
  */
 #ifdef HAVE_CONFIG_H
-#  include "config.h"
+#  include <config.h>
 #endif
 
 #include "gstwasapiutil.h"
@@ -543,7 +543,7 @@ out:
 
 gboolean
 gst_wasapi_util_get_device_client (GstElement * self,
-    gint data_flow, gint role, const wchar_t * device_strid,
+    gboolean capture, gint role, const wchar_t * device_strid,
     IMMDevice ** ret_device, IAudioClient ** ret_client)
 {
   gboolean res = FALSE;
@@ -556,8 +556,8 @@ gst_wasapi_util_get_device_client (GstElement * self,
     goto beach;
 
   if (!device_strid) {
-    hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint (enumerator, data_flow,
-        role, &device);
+    hr = IMMDeviceEnumerator_GetDefaultAudioEndpoint (enumerator,
+        capture ? eCapture : eRender, role, &device);
     HR_FAILED_GOTO (hr, IMMDeviceEnumerator::GetDefaultAudioEndpoint, beach);
   } else {
     hr = IMMDeviceEnumerator_GetDevice (enumerator, device_strid, &device);
@@ -840,11 +840,11 @@ gboolean
 gst_wasapi_util_initialize_audioclient (GstElement * self,
     GstAudioRingBufferSpec * spec, IAudioClient * client,
     WAVEFORMATEX * format, guint sharemode, gboolean low_latency,
-    gboolean loopback, guint * ret_devicep_frames)
+    guint * ret_devicep_frames)
 {
   REFERENCE_TIME default_period, min_period;
   REFERENCE_TIME device_period, device_buffer_duration;
-  guint rate, stream_flags;
+  guint rate;
   HRESULT hr;
 
   hr = IAudioClient_GetDevicePeriod (client, &default_period, &min_period);
@@ -870,16 +870,8 @@ gst_wasapi_util_initialize_audioclient (GstElement * self,
         min_period, &device_period, &device_buffer_duration);
   }
 
-  /* For some reason, we need to call this a second time for exclusive mode */
-  if (sharemode == AUDCLNT_SHAREMODE_EXCLUSIVE)
-    CoInitialize (NULL);
-
-  stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-  if (loopback)
-    stream_flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
-
-  hr = IAudioClient_Initialize (client, sharemode, stream_flags,
-      device_buffer_duration,
+  hr = IAudioClient_Initialize (client, sharemode,
+      AUDCLNT_STREAMFLAGS_EVENTCALLBACK, device_buffer_duration,
       /* This must always be 0 in shared mode */
       sharemode == AUDCLNT_SHAREMODE_SHARED ? 0 : device_period, format, NULL);
 
@@ -899,8 +891,9 @@ gst_wasapi_util_initialize_audioclient (GstElement * self,
     GST_WARNING_OBJECT (self, "trying to re-initialize with period %i "
         "(%i frames, %i rate)", (int) device_period, n_frames, rate);
 
-    hr = IAudioClient_Initialize (client, sharemode, stream_flags,
-        device_period, device_period, format, NULL);
+    hr = IAudioClient_Initialize (client, sharemode,
+        AUDCLNT_STREAMFLAGS_EVENTCALLBACK, device_period,
+        device_period, format, NULL);
   }
   HR_FAILED_RET (hr, IAudioClient::Initialize, FALSE);
 
@@ -912,16 +905,12 @@ gst_wasapi_util_initialize_audioclient (GstElement * self,
 gboolean
 gst_wasapi_util_initialize_audioclient3 (GstElement * self,
     GstAudioRingBufferSpec * spec, IAudioClient3 * client,
-    WAVEFORMATEX * format, gboolean low_latency, gboolean loopback,
-    guint * ret_devicep_frames)
+    WAVEFORMATEX * format, gboolean low_latency, guint * ret_devicep_frames)
 {
   HRESULT hr;
-  gint stream_flags;
-  guint rate, devicep_frames;
+  guint devicep_frames;
   guint defaultp_frames, fundp_frames, minp_frames, maxp_frames;
   WAVEFORMATEX *tmpf;
-
-  rate = GST_AUDIO_INFO_RATE (&spec->info);
 
   hr = IAudioClient3_GetSharedModeEnginePeriod (client, format,
       &defaultp_frames, &fundp_frames, &minp_frames, &maxp_frames);
@@ -931,23 +920,15 @@ gst_wasapi_util_initialize_audioclient3 (GstElement * self,
       "fundamental period %i frames, minimum period %i frames, maximum period "
       "%i frames", defaultp_frames, fundp_frames, minp_frames, maxp_frames);
 
-  if (low_latency) {
+  if (low_latency)
     devicep_frames = minp_frames;
-  } else {
-    /* rate is in Hz, latency_time is in usec */
-    int tmp = (rate * spec->latency_time * GST_USECOND) / GST_SECOND;
-    devicep_frames = CLAMP (tmp, minp_frames, maxp_frames);
-    /* Ensure it's a multiple of the fundamental period */
-    tmp = devicep_frames / fundp_frames;
-    devicep_frames = tmp * fundp_frames;
-  }
+  else
+    /* Just pick the max period, because lower values can cause glitches
+     * https://bugzilla.gnome.org/show_bug.cgi?id=794497 */
+    devicep_frames = maxp_frames;
 
-  stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-  if (loopback)
-    stream_flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
-
-  hr = IAudioClient3_InitializeSharedAudioStream (client, stream_flags,
-      devicep_frames, format, NULL);
+  hr = IAudioClient3_InitializeSharedAudioStream (client,
+      AUDCLNT_STREAMFLAGS_EVENTCALLBACK, devicep_frames, format, NULL);
   HR_FAILED_RET (hr, IAudioClient3::InitializeSharedAudioStream, FALSE);
 
   hr = IAudioClient3_GetCurrentSharedModeEnginePeriod (client, &tmpf,
