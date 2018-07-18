@@ -192,6 +192,7 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->stop_handle = CreateEvent (NULL, FALSE, FALSE, NULL);
   self->client_needs_restart = FALSE;
   self->capture_too_many_frames_log_count = 0;
+  self->client_needs_restart = FALSE;
 
   CoInitialize (NULL);
 }
@@ -588,6 +589,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
     guint have_frames, n_frames, want_frames, read_len;
 
     /* Wait for data to become available */
+
     HANDLE events[2] = {
       self->event_handle,
       self->stop_handle
