@@ -41,7 +41,6 @@
 #endif
 
 #include "gstwasapisrc.h"
-
 #include <avrt.h>
 
 GST_DEBUG_CATEGORY_STATIC (gst_wasapi_src_debug);
@@ -69,7 +68,8 @@ enum
   PROP_LOOPBACK,
   PROP_EXCLUSIVE,
   PROP_LOW_LATENCY,
-  PROP_AUDIOCLIENT3
+  PROP_AUDIOCLIENT3,
+  PROP_RESTART_REQUIRED
 };
 
 static void gst_wasapi_src_dispose (GObject * object);
@@ -149,6 +149,12 @@ gst_wasapi_src_class_init (GstWasapiSrcClass * klass)
           "Whether to use the Windows 10 AudioClient3 API when available",
           DEFAULT_AUDIOCLIENT3, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property(gobject_class,
+    PROP_RESTART_REQUIRED,
+    g_param_spec_boolean("restart-required", "Should we restart plugin",
+      "EOS signals don't work so we need to hack around this",
+      FALSE, G_PARAM_READABLE));
+
   gst_element_class_add_static_pad_template (gstelement_class, &src_template);
   gst_element_class_set_static_metadata (gstelement_class, "WasapiSrc",
       "Source/Audio",
@@ -193,7 +199,8 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->client_needs_restart = FALSE;
   self->capture_too_many_frames_log_count = 0;
   self->client_needs_restart = FALSE;
-
+  self->change_initialized = 0;
+  self->eos_sent = FALSE;
   CoInitialize (NULL);
 }
 
@@ -225,6 +232,14 @@ gst_wasapi_src_dispose (GObject * object)
   if (self->capture_client != NULL) {
     IUnknown_Release (self->capture_client);
     self->capture_client = NULL;
+  }
+
+  if (self->change_initialized && self->change.client.lpVtbl) {
+    change_notify * change = &self->change;
+    self->change_initialized = 0;
+    IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(
+      change->pEnumerator, (IMMNotificationClient *)change);
+    IUnknown_Release(change->pEnumerator);
   }
 
   G_OBJECT_CLASS (parent_class)->dispose (object);
@@ -310,6 +325,9 @@ gst_wasapi_src_get_property (GObject * object, guint prop_id,
       break;
     case PROP_AUDIOCLIENT3:
       g_value_set_boolean (value, self->try_audioclient3);
+      break;
+    case PROP_RESTART_REQUIRED:
+      g_value_set_boolean(value, self->eos_sent);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -415,7 +433,9 @@ gst_wasapi_src_open (GstAudioSrc * asrc)
           ("Failed to open device %S", self->device_strid));
     goto beach;
   }
-
+  if (!self->device_strid) {
+    gst_wasapi_util_initialize_notification_client(self);
+  }
   self->client = client;
   self->device = device;
   res = TRUE;
@@ -595,6 +615,9 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
       self->stop_handle
     };
     dwWaitResult = WaitForMultipleObjects (2, events, FALSE, INFINITE);
+    if (!self->device_strid && g_atomic_int_get(&(self->change.default_changed))) {
+      goto device_disappeared;
+    }
     switch (dwWaitResult) {
       case WAIT_OBJECT_0:
         break;
@@ -610,7 +633,10 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
 
     hr = IAudioCaptureClient_GetBuffer (self->capture_client,
         (BYTE **) & from, &have_frames, &flags, NULL, NULL);
-    if (hr != S_OK) {
+    if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+      goto device_disappeared; 
+    }
+    else if (hr != S_OK) {
       gchar *msg = gst_wasapi_util_hresult_to_string (hr);
       if (hr == AUDCLNT_S_BUFFER_EMPTY)
         GST_WARNING_OBJECT (self, "IAudioCaptureClient::GetBuffer failed: %s"
@@ -651,7 +677,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
 
     {
       guint bpf = self->mix_format->nBlockAlign;
-      GST_DEBUG_OBJECT (self, "have: %i (%i bytes), can read: %i (%i bytes), "
+      GST_LOG_OBJECT (self, "have: %i (%i bytes), can read: %i (%i bytes), "
           "will read: %i (%i bytes)", have_frames, have_frames * bpf,
           want_frames, wanted, n_frames, read_len);
     }
@@ -666,8 +692,39 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
 
 
 beach:
-
+  // TODO: We need to properly buffer the results from GetBuffer because they return
+  // an arbitrary amount of audio samples.  However, if we never empty this thing out
+  // USB audio devices will glitch out after they fill up.  Right now, if there is 
+  // extra samples coming from the device we will just drop them.
+  // The guard is hr == S_OK because we don't want to try pulling frames if we came
+  // here because there was an error.
+#if 0
+  while (hr == S_OK) {
+    guint have_frames;
+    hr = IAudioCaptureClient_GetBuffer(self->capture_client,
+      (BYTE **)& from, &have_frames, &flags, NULL, NULL);
+    if (hr == S_OK) {
+      GST_WARNING("Buffer Not Empty. Dropping audio frames");
+      IAudioCaptureClient_ReleaseBuffer(self->capture_client, have_frames);
+    }
+  }
+#endif
   return length;
+device_disappeared:
+  {
+    if (!self->eos_sent) {
+      GST_INFO_OBJECT(asrc, "The audio device has been disconnected.");
+      gboolean success = gst_element_post_message(GST_ELEMENT(self),
+        gst_message_new_element(GST_OBJECT(self),
+          gst_structure_new("wasapi_restart",
+            NULL)));
+      if (!success) {
+        GST_WARNING("Unable to send message");
+      }
+      self->eos_sent = TRUE;
+    }
+    return (guint) length;
+  }
 }
 
 static guint

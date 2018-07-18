@@ -36,6 +36,13 @@ G_BEGIN_DECLS
 typedef struct _GstWasapiSrc GstWasapiSrc;
 typedef struct _GstWasapiSrcClass GstWasapiSrcClass;
 
+typedef struct change_notify {
+  IMMNotificationClient client; // this must be first in the structure!
+  IMMDeviceEnumerator *pEnumerator; // object where client is registered
+  LPWSTR monitored; // Monitored device
+  guint default_changed;
+} change_notify;
+
 struct _GstWasapiSrc
 {
   GstAudioSrc parent;
@@ -43,6 +50,7 @@ struct _GstWasapiSrc
   IMMDevice *device;
   IAudioClient *client;
   IAudioClock *client_clock;
+  IMMNotificationClient notification_client;
   guint64 client_clock_freq;
   IAudioCaptureClient *capture_client;
   HANDLE event_handle;
@@ -61,6 +69,11 @@ struct _GstWasapiSrc
    * we will pass this to GstAudioRingbuffer so it can
    * translate it to the native GStreamer channel layout. */
   GstAudioChannelPosition *positions;
+
+  // Default Audio Device changed
+  change_notify change;
+  gint change_initialized;
+  gboolean eos_sent;
 
   /* properties */
   gint role;
