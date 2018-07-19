@@ -43,6 +43,17 @@
 #include "gstwasapisrc.h"
 #include <avrt.h>
 
+#if defined(_MSC_VER)
+#include <functiondiscoverykeys_devpkey.h>
+#elif !defined(PKEY_Device_FriendlyName)
+#include <initguid.h>
+#include <propkey.h>
+DEFINE_PROPERTYKEY (PKEY_Device_FriendlyName, 0xa45c254e, 0xdf1c, 0x4efd, 0x80,
+    0x20, 0x67, 0xd1, 0x46, 0xa8, 0x50, 0xe0, 14);
+DEFINE_PROPERTYKEY (PKEY_AudioEngine_DeviceFormat, 0xf19f064d, 0x82c, 0x4e27,
+    0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c, 0);
+#endif
+
 GST_DEBUG_CATEGORY_STATIC (gst_wasapi_src_debug);
 #define GST_CAT_DEFAULT gst_wasapi_src_debug
 
@@ -69,7 +80,9 @@ enum
   PROP_EXCLUSIVE,
   PROP_LOW_LATENCY,
   PROP_AUDIOCLIENT3,
-  PROP_RESTART_REQUIRED
+  PROP_RESTART_REQUIRED,
+  PROP_SAMPLE_RATE,
+  PROP_DEVICE_DESCRIPTION,
 };
 
 static void gst_wasapi_src_dispose (GObject * object);
@@ -155,6 +168,18 @@ gst_wasapi_src_class_init (GstWasapiSrcClass * klass)
       "EOS signals don't work so we need to hack around this",
       FALSE, G_PARAM_READABLE));
 
+  g_object_class_install_property (gobject_class,
+      PROP_SAMPLE_RATE,
+      g_param_spec_int("sample-rate", "Sample Rate",
+          "Sample Rate in Hz",
+          0, 1000000, 0, G_PARAM_READABLE));
+
+  g_object_class_install_property (gobject_class,
+      PROP_DEVICE_DESCRIPTION,
+      g_param_spec_string ("description", "Device Description",
+          "Friendly Name of device ",
+          NULL, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+
   gst_element_class_add_static_pad_template (gstelement_class, &src_template);
   gst_element_class_set_static_metadata (gstelement_class, "WasapiSrc",
       "Source/Audio",
@@ -179,6 +204,7 @@ gst_wasapi_src_class_init (GstWasapiSrcClass * klass)
 static void
 gst_wasapi_src_init (GstWasapiSrc * self)
 {
+
 #ifdef DEFAULT_PROVIDE_CLOCK
   /* override with a custom clock */
   if (GST_AUDIO_BASE_SRC (self)->clock)
@@ -189,6 +215,8 @@ gst_wasapi_src_init (GstWasapiSrc * self)
       (GDestroyNotify) gst_object_unref);
 #endif
 
+  self->sample_rate = 0;
+  self->device_description = NULL;
   self->role = DEFAULT_ROLE;
   self->sharemode = AUDCLNT_SHAREMODE_SHARED;
   self->loopback = DEFAULT_LOOPBACK;
@@ -258,6 +286,8 @@ gst_wasapi_src_finalize (GObject * object)
   g_clear_pointer (&self->cached_caps, gst_caps_unref);
   g_clear_pointer (&self->positions, g_free);
   g_clear_pointer (&self->device_strid, g_free);
+  g_clear_pointer (&self->device_description, g_free);
+  self->sample_rate = 0;
 
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
@@ -328,6 +358,12 @@ gst_wasapi_src_get_property (GObject * object, guint prop_id,
       break;
     case PROP_RESTART_REQUIRED:
       g_value_set_boolean(value, self->eos_sent);
+      break;
+    case PROP_SAMPLE_RATE:
+      g_value_set_int(value, self->sample_rate);
+      break;
+    case PROP_DEVICE_DESCRIPTION:
+      g_value_set_string (value, self->device_description);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -407,6 +443,7 @@ out:
   return caps;
 }
 
+
 static gboolean
 gst_wasapi_src_open (GstAudioSrc * asrc)
 {
@@ -414,6 +451,7 @@ gst_wasapi_src_open (GstAudioSrc * asrc)
   gboolean res = FALSE;
   IAudioClient *client = NULL;
   IMMDevice *device = NULL;
+  IPropertyStore *prop_store = NULL;
 
   if (self->client)
     return TRUE;
@@ -440,8 +478,27 @@ gst_wasapi_src_open (GstAudioSrc * asrc)
   self->device = device;
   res = TRUE;
 
+  HRESULT hr = IMMDevice_OpenPropertyStore(device, STGM_READ, &prop_store);
+  if (hr != S_OK) {
+      goto beach;
+  }
+  
+  PROPVARIANT var;
+  PropVariantInit (&var);
+  hr = IPropertyStore_GetValue (prop_store, &PKEY_Device_FriendlyName, &var);
+  if (hr != S_OK) {
+    goto beach;
+  }
+  self->device_description = g_utf16_to_utf8 (var.pwszVal, -1, NULL, NULL, NULL);
+  PropVariantClear (&var);
+  GST_INFO_OBJECT (self, "device description %s", self->device_description);
+    
+
 beach:
 
+  if (prop_store) {
+    IUnknown_Release (prop_store);
+  }
   return res;
 }
 
@@ -496,6 +553,7 @@ gst_wasapi_src_prepare (GstAudioSrc * asrc, GstAudioRingBufferSpec * spec)
   GST_INFO_OBJECT (self, "buffer size is %i frames, device period is %i "
       "frames, bpf is %i bytes, rate is %i Hz", buffer_frames,
       devicep_frames, bpf, rate);
+  self->sample_rate = rate;
 
   /* Actual latency-time/buffer-time will be different now */
   spec->segsize = devicep_frames * bpf;

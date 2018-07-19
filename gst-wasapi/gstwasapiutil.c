@@ -801,7 +801,7 @@ static void
 gst_wasapi_util_channel_position_all_none (guint channels,
     GstAudioChannelPosition * position)
 {
-  int ii;
+  guint ii;
   for (ii = 0; ii < channels; ii++)
     position[ii] = GST_AUDIO_CHANNEL_POSITION_NONE;
 }
@@ -813,7 +813,6 @@ static guint64
 gst_wasapi_util_waveformatex_to_channel_mask (WAVEFORMATEXTENSIBLE * format,
     GstAudioChannelPosition ** out_position)
 {
-  int ii;
   guint64 mask = 0;
   WORD nChannels = format->Format.nChannels;
   DWORD dwChannelMask = format->dwChannelMask;
@@ -841,7 +840,7 @@ gst_wasapi_util_waveformatex_to_channel_mask (WAVEFORMATEXTENSIBLE * format,
    * KSAUDIO_SPEAKER_7POINT1_SURROUND, 8 channels has different mapping
    * than the regular KSAUDIO_SPEAKER_7POINT1, so we have a special case to
    * handle diverged mapping. */
-  for (ii = 0; ii < nChannels; ii++) {
+  for (int ii = 0; ii < nChannels; ii++) {
     if (!(dwChannelMask & wasapi_to_gst_pos[ii].wasapi_pos)) {
       gboolean is_valid_diverge_mapping = FALSE;
 
@@ -889,7 +888,6 @@ gst_wasapi_util_parse_waveformatex (WAVEFORMATEXTENSIBLE * format,
     GstCaps * template_caps, GstCaps ** out_caps,
     GstAudioChannelPosition ** out_positions)
 {
-  int ii;
   const gchar *afmt;
   guint64 channel_mask;
 
@@ -918,7 +916,7 @@ gst_wasapi_util_parse_waveformatex (WAVEFORMATEXTENSIBLE * format,
   channel_mask =
       gst_wasapi_util_waveformatex_to_channel_mask (format, out_positions);
 
-  for (ii = 0; ii < gst_caps_get_size (*out_caps); ii++) {
+  for (guint ii = 0; ii < gst_caps_get_size (*out_caps); ii++) {
     GstStructure *s = gst_caps_get_structure (*out_caps, ii);
 
     gst_structure_set (s,

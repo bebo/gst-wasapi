@@ -81,7 +81,9 @@ struct _GstWasapiSrc
   gboolean loopback;
   gboolean low_latency;
   gboolean try_audioclient3;
+  gint sample_rate;
   wchar_t *device_strid;
+  gchar *device_description;
 
   guint64 capture_too_many_frames_log_count;
 };
