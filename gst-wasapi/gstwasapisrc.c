@@ -684,7 +684,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
       data_ptr += n;
       wanted -= n;
 
-      GST_INFO_OBJECT(self, "restored %i bytes from overflow", n);
+      GST_LOG_OBJECT(self, "restored %i bytes from overflow", n);
       if (n == self->overflow_buffer_length) {
           self->overflow_buffer_ptr = 0;
           self->overflow_buffer_length = 0;
@@ -796,7 +796,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
                 gpointer from_ptr = &(from_buffer[read_len]);
                 memcpy(write_ptr, from_ptr, save_length);
                 self->overflow_buffer_length += (guint) save_length;
-                GST_INFO_OBJECT(self, "saved %i bytes to overflow", save_length);
+                GST_LOG_OBJECT(self, "saved %i bytes to overflow", save_length);
             }
         }
 
