@@ -11,7 +11,7 @@ JENKINS_PROJECT = 'gst-wasapi'
 
 
 JENKINS_URL = "https://#{JENKINS_HOST}/job/#{JENKINS_PROJECT}/"
-JENKINS_TOKEN = 'uBC3kFJF'
+JENKINS_TOKEN = 'u0d6jw9xMC5cGrEpCrniKfa5u96SgIp9'
 
 IS_WINDOWS = (RbConfig::CONFIG['host_os'] =~ /mswin|mingw|cygwin/)
 
