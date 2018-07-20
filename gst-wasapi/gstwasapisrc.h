@@ -56,6 +56,11 @@ struct _GstWasapiSrc
   HANDLE event_handle;
   HANDLE stop_handle;
   HANDLE thread_priority_handle;
+
+  gsize overflow_buffer_size;
+  guint overflow_buffer_ptr;
+  guint overflow_buffer_length;
+  guint8 * overflow_buffer;
   /* Client was reset, so it needs to be started again */
   gboolean client_needs_restart;
 

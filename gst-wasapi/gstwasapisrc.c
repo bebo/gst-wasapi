@@ -564,6 +564,11 @@ gst_wasapi_src_prepare (GstAudioSrc * asrc, GstAudioRingBufferSpec * spec)
   GST_INFO_OBJECT (self, "segsize is %i, segtotal is %i", spec->segsize,
       spec->segtotal);
 
+  self->overflow_buffer_size = spec->segsize * 4;
+  self->overflow_buffer_ptr = 0;
+  self->overflow_buffer_length = 0;
+  self->overflow_buffer = g_malloc(self->overflow_buffer_size);
+
   /* Get WASAPI latency for logging */
   hr = IAudioClient_GetStreamLatency (self->client, &latency_rt);
   HR_FAILED_GOTO (hr, IAudioClient::GetStreamLatency, beach);
@@ -639,6 +644,14 @@ gst_wasapi_src_unprepare (GstAudioSrc * asrc)
   self->client_clock_freq = 0;
   self->capture_too_many_frames_log_count = 0;
 
+  if (self->overflow_buffer != NULL) {
+    g_free(self->overflow_buffer);
+    self->overflow_buffer = NULL;
+    self->overflow_buffer_size = 0;
+    self->overflow_buffer_ptr = 0;
+    self->overflow_buffer_length = 0;
+  }
+
   CoUninitialize ();
 
   return TRUE;
@@ -653,6 +666,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
   gint16 *from = NULL;
   guint wanted = length;
   DWORD flags;
+  guint8 *data_ptr = data;
 
   GST_OBJECT_LOCK (self);
   if (self->client_needs_restart) {
@@ -661,6 +675,25 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
     self->client_needs_restart = FALSE;
   }
   GST_OBJECT_UNLOCK (self);
+
+  if (G_UNLIKELY(self->overflow_buffer_length > 0)) {
+      guint n = MIN(self->overflow_buffer_length, wanted);
+
+      gpointer ptr = &(self->overflow_buffer[self->overflow_buffer_ptr]);
+      memcpy(data_ptr, ptr, n);
+      data_ptr += n;
+      wanted -= n;
+
+      GST_INFO_OBJECT(self, "restored %i bytes from overflow", n);
+      if (n == self->overflow_buffer_length) {
+          self->overflow_buffer_ptr = 0;
+          self->overflow_buffer_length = 0;
+      } else {
+          GST_WARNING_OBJECT(self, "WASAPI more in overflow that wanted");
+          self->overflow_buffer_ptr += n;
+          self->overflow_buffer_length -= n;
+      }
+  }
 
   while (wanted > 0) {
     DWORD dwWaitResult;
@@ -680,7 +713,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
       case WAIT_OBJECT_0:
         break;
       case WAIT_OBJECT_0 + 1: // Received a stop signal, going to fill data with silent
-        memset (data, 0, wanted);
+        memset (data_ptr, 0, wanted);
         goto beach;
       default:
         GST_ERROR_OBJECT (self, "Error waiting for event handle: %x",
@@ -689,63 +722,88 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
         goto beach;
     }
 
-    hr = IAudioCaptureClient_GetBuffer (self->capture_client,
-        (BYTE **) & from, &have_frames, &flags, NULL, NULL);
-    if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
-      goto device_disappeared; 
+    // fully drain the wasapi driver - we may not get a new signal for pending buffers
+    // https://blogs.msdn.microsoft.com/matthew_van_eerde/2014/11/05/draining-the-wasapi-capture-buffer-fully/
+    int i = 0;
+    while (TRUE) {
+
+        hr = IAudioCaptureClient_GetBuffer(self->capture_client,
+            (BYTE **)& from, &have_frames, &flags, NULL, NULL);
+        if (hr == AUDCLNT_E_DEVICE_INVALIDATED) {
+            goto device_disappeared;
+        }
+        else if (hr == AUDCLNT_S_BUFFER_EMPTY) {
+            gchar *msg = gst_wasapi_util_hresult_to_string(hr);
+            GST_LOG_OBJECT(self, "IAudioCaptureClient::GetBuffer failed: %s"
+                ", retrying later", msg);
+            break;
+        }
+        else if (hr != S_OK) {
+            gchar *msg = gst_wasapi_util_hresult_to_string(hr);
+            GST_ERROR_OBJECT(self, "IAudioCaptureClient::GetBuffer failed: %s", msg);
+            g_free(msg);
+            length = 0;
+            goto beach;
+        }
+        if (i > 0) {
+            GST_INFO_OBJECT(self, "draining WASAPI buffer %i", i);
+        }
+        i++;
+
+        int mask_handled = MAXINT ^ (AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY | AUDCLNT_BUFFERFLAGS_SILENT);
+        if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY) {
+            GST_WARNING_OBJECT(self, "WASAPI reported glitch in buffer");
+        } 
+        
+        if ((flags & mask_handled) != 0) {
+            GST_INFO_OBJECT(self, "buffer flags=%#08x", (guint)flags);
+        }
+
+        want_frames = wanted / self->mix_format->nBlockAlign;
+
+        /* Only copy data that will fit into the allocated buffer of size @length */
+        n_frames = MIN (have_frames, want_frames);
+        read_len = n_frames * self->mix_format->nBlockAlign;
+
+        {
+          guint bpf = self->mix_format->nBlockAlign;
+          GST_LOG_OBJECT (self, "have: %i (%i bytes), can read: %i (%i bytes), "
+              "will read: %i (%i bytes)", have_frames, have_frames * bpf,
+              want_frames, wanted, n_frames, read_len);
+        }
+
+        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+            memset(data_ptr, 0, read_len);
+        } else {
+            memcpy(data_ptr, from, read_len);
+        }
+
+        data_ptr += read_len; // we loop - so we need to also advance data
+        wanted -= read_len;
+
+        /* save to overflow if we got more data from the driver than we have room for */
+        if (G_UNLIKELY(have_frames > want_frames)) {
+            guint save_frames = have_frames - want_frames;
+            gsize save_length = save_frames * self->mix_format->nBlockAlign;
+
+            if ((self->overflow_buffer_length + save_length + self->overflow_buffer_ptr) >
+                self->overflow_buffer_size) {
+                GST_ERROR_OBJECT(self, "can't save overflow at: %i length: %i bytes want %i more bytes space is %i",
+                                 self->overflow_buffer_ptr, self->overflow_buffer_length, save_length, self->overflow_buffer_size);
+            } else {
+                gpointer write_ptr = &(self->overflow_buffer[self->overflow_buffer_length]);
+                guint8 * from_buffer = (guint8 *) from;
+                gpointer from_ptr = &(from_buffer[read_len]);
+                memcpy(write_ptr, from_ptr, save_length);
+                self->overflow_buffer_length += (guint) save_length;
+                GST_INFO_OBJECT(self, "saved %i bytes to overflow", save_length);
+            }
+        }
+
+        /* Always release all captured buffers if we've captured any at all */
+        hr = IAudioCaptureClient_ReleaseBuffer (self->capture_client, have_frames);
+        HR_FAILED_AND (hr, IAudioClock::ReleaseBuffer, goto beach);
     }
-    else if (hr != S_OK) {
-      gchar *msg = gst_wasapi_util_hresult_to_string (hr);
-      if (hr == AUDCLNT_S_BUFFER_EMPTY)
-        GST_WARNING_OBJECT (self, "IAudioCaptureClient::GetBuffer failed: %s"
-            ", retrying", msg);
-      else
-        GST_ERROR_OBJECT (self, "IAudioCaptureClient::GetBuffer failed: %s",
-            msg);
-      g_free (msg);
-      length = 0;
-      goto beach;
-    }
-
-    if (flags != 0)
-      GST_INFO_OBJECT (self, "buffer flags=%#08x", (guint) flags);
-
-    /* XXX: How do we handle AUDCLNT_BUFFERFLAGS_SILENT? We're supposed to write
-     * out silence when that flag is set? See:
-     * https://msdn.microsoft.com/en-us/library/windows/desktop/dd370800(v=vs.85).aspx */
-
-    if (flags & AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY)
-      GST_WARNING_OBJECT (self, "WASAPI reported glitch in buffer");
-
-    want_frames = wanted / self->mix_format->nBlockAlign;
-
-    /* If GetBuffer is returning more frames than we can handle, all we can do is
-     * hope that this is temporary and that things will settle down later. */
-    if (G_UNLIKELY(have_frames > want_frames)) {
-      if (self->capture_too_many_frames_log_count % 6000 == 0) {
-        GST_WARNING_OBJECT(self, "captured too many frames: have %i, want %i",
-          have_frames, want_frames);
-      }
-      self->capture_too_many_frames_log_count++;
-    }
-
-    /* Only copy data that will fit into the allocated buffer of size @length */
-    n_frames = MIN (have_frames, want_frames);
-    read_len = n_frames * self->mix_format->nBlockAlign;
-
-    {
-      guint bpf = self->mix_format->nBlockAlign;
-      GST_LOG_OBJECT (self, "have: %i (%i bytes), can read: %i (%i bytes), "
-          "will read: %i (%i bytes)", have_frames, have_frames * bpf,
-          want_frames, wanted, n_frames, read_len);
-    }
-
-    memcpy (data, from, read_len);
-    wanted -= read_len;
-
-    /* Always release all captured buffers if we've captured any at all */
-    hr = IAudioCaptureClient_ReleaseBuffer (self->capture_client, have_frames);
-    HR_FAILED_AND (hr, IAudioClock::ReleaseBuffer, goto beach);
   }
 
 
