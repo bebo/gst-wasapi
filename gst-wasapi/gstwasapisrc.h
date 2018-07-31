@@ -63,6 +63,10 @@ struct _GstWasapiSrc
   guint8 *overflow_buffer;
 
   gint64 initial_timestamp_diff;
+  guint64 timeshifted_count;
+  guint64 drift_correction_count;
+  guint64 drift_correction_threshold;
+
   /* Client was reset, so it needs to be started again */
   gboolean client_needs_restart;
 

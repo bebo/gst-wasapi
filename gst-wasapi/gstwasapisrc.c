@@ -83,6 +83,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
 /* The clock provided by WASAPI is always off and causes buffers to be late
  * very quickly on the sink. Disable pending further investigation. */
 #define DEFAULT_PROVIDE_CLOCK FALSE
+#define DEFAULT_DRIFT_CORRECTION_THRESHOLD  50 * 100000 // 50ms
 
 enum
 {
@@ -96,6 +97,9 @@ enum
   PROP_RESTART_REQUIRED,
   PROP_SAMPLE_RATE,
   PROP_DEVICE_DESCRIPTION,
+  PROP_TIMESHIFTED_COUNT,
+  PROP_DRIFT_CORRECTION_COUNT,
+  PROP_DRIFT_CORRECTION_THRESHOLD,
 };
 
 static GstFlowReturn gst_audio_base_src_create (GstBaseSrc * bsrc,
@@ -198,6 +202,25 @@ gst_wasapi_src_class_init (GstWasapiSrcClass * klass)
           "Friendly Name of device ",
           NULL, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class,
+      PROP_TIMESHIFTED_COUNT,
+      g_param_spec_uint64("timeshifted-count", "Timeshifted buffer count",
+          "Number of buffer got timeshifted",
+          0, G_MAXUINT64, 0, G_PARAM_READABLE));
+
+  g_object_class_install_property (gobject_class,
+      PROP_DRIFT_CORRECTION_COUNT,
+      g_param_spec_uint64("drift-correction-count", "Drifted buffer count",
+          "Number of buffer that is difted more than drift correction threshold",
+          0, G_MAXUINT64, 0, G_PARAM_READABLE));
+
+  g_object_class_install_property (gobject_class,
+      PROP_DRIFT_CORRECTION_THRESHOLD,
+      g_param_spec_uint64("drift-correction-threshold", "Drifted buffer threshold (nanoseconds)",
+          "The threshold in nanoseconds for when we start correcting drifted buffers",
+          0, G_MAXUINT64, DEFAULT_DRIFT_CORRECTION_THRESHOLD,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gst_element_class_add_static_pad_template (gstelement_class, &src_template);
   gst_element_class_set_static_metadata (gstelement_class, "WasapiSrc",
       "Source/Audio",
@@ -248,6 +271,9 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->change_initialized = 0;
   self->eos_sent = FALSE;
   self->initial_timestamp_diff = 0;
+  self->timeshifted_count = 0;
+  self->drift_correction_count = 0;
+  self->drift_correction_threshold = DEFAULT_DRIFT_CORRECTION_THRESHOLD;
   CoInitialize (NULL);
 }
 
@@ -342,6 +368,9 @@ gst_wasapi_src_set_property (GObject * object, guint prop_id,
     case PROP_AUDIOCLIENT3:
       self->try_audioclient3 = g_value_get_boolean (value);
       break;
+    case PROP_DRIFT_CORRECTION_THRESHOLD:
+      self->drift_correction_threshold = g_value_get_uint64 (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -383,6 +412,15 @@ gst_wasapi_src_get_property (GObject * object, guint prop_id,
       break;
     case PROP_DEVICE_DESCRIPTION:
       g_value_set_string (value, self->device_description);
+      break;
+    case PROP_TIMESHIFTED_COUNT:
+      g_value_set_uint64 (value, self->timeshifted_count);
+      break;
+    case PROP_DRIFT_CORRECTION_COUNT:
+      g_value_set_uint64 (value, self->drift_correction_count);
+      break;
+    case PROP_DRIFT_CORRECTION_THRESHOLD:
+      g_value_set_uint64 (value, self->drift_correction_threshold);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -1156,9 +1194,10 @@ gst_audio_base_src_create (GstBaseSrc * bsrc, guint64 offset, guint length,
         }
 
         gint64 drift_ns = timestamp_diff > 0 ? ABS(self->initial_timestamp_diff - timestamp_diff) : 0; //nanoseconds
-        if (drift_ns > 50 * 1000000) { // 50ms
+        if (drift_ns > self->drift_correction_threshold) {
           drift_correction = TRUE;
           self->initial_timestamp_diff = 0;
+          self->drift_correction_count++;
         }
 
         GST_DEBUG_OBJECT (bsrc,
@@ -1216,8 +1255,9 @@ gst_audio_base_src_create (GstBaseSrc * bsrc, guint64 offset, guint length,
               "Updating the timestamp to %" GST_TIME_FORMAT ", "
               "and src->next_sample to %" G_GUINT64_FORMAT, segment_diff,
               GST_TIME_ARGS (timestamp), src->next_sample);
-        }
 
+          self->timeshifted_count++;
+        }
         break;
       }
       case GST_AUDIO_BASE_SRC_SLAVE_SKEW:
@@ -1321,6 +1361,8 @@ gst_audio_base_src_create (GstBaseSrc * bsrc, guint64 offset, guint length,
               "Updating the timestamp to %" GST_TIME_FORMAT ", "
               "and src->next_sample to %" G_GUINT64_FORMAT, segment_diff,
               GST_TIME_ARGS (timestamp), src->next_sample);
+
+          self->timeshifted_count++;
         }
         break;
       }
