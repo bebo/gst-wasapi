@@ -247,6 +247,7 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->client_needs_restart = FALSE;
   self->change_initialized = 0;
   self->eos_sent = FALSE;
+  self->initial_timestamp_diff = 0;
   CoInitialize (NULL);
 }
 
@@ -978,6 +979,7 @@ gst_audio_base_src_create (GstBaseSrc * bsrc, guint64 offset, guint length,
     GstBuffer ** outbuf)
 {
   GstAudioBaseSrc *src = GST_AUDIO_BASE_SRC (bsrc);
+  GstWasapiSrc *self = GST_WASAPI_SRC (bsrc);
   GstFlowReturn ret;
   GstBuffer *buf;
   GstMapInfo info;
@@ -1100,6 +1102,124 @@ gst_audio_base_src_create (GstBaseSrc * bsrc, guint64 offset, guint length,
         /* Not implemented, use skew algorithm. This algorithm should
          * work on the readout pointer and produce more or less samples based
          * on the clock drift */
+      {
+        GstClockTime running_time;
+        GstClockTime base_time;
+        GstClockTime current_time;
+        guint64 running_time_sample;
+        gint running_time_segment;
+        gint last_read_segment;
+        gint segment_skew;
+        gint sps;
+        gint segments_written;
+        gint last_written_segment;
+        gboolean drift_correction = FALSE;
+
+        /* get the amount of segments written from the device by now */
+        segments_written = g_atomic_int_get (&ringbuffer->segdone);
+
+        /* subtract the base to segments_written to get the number of the
+         * last written segment in the ringbuffer
+         * (one segment written = segment 0) */
+        last_written_segment = segments_written - ringbuffer->segbase - 1;
+
+        /* samples per segment */
+        sps = ringbuffer->samples_per_seg;
+
+        /* get the current time */
+        current_time = gst_clock_get_time (clock);
+
+        /* get the basetime */
+        base_time = GST_ELEMENT_CAST (src)->base_time;
+
+        /* get the running_time */
+        running_time = current_time - base_time;
+
+        /* the running_time converted to a sample
+         * (relative to the ringbuffer) */
+        running_time_sample =
+            gst_util_uint64_scale_int (running_time, rate, GST_SECOND);
+
+        /* the segmentnr corresponding to running_time, round down */
+        running_time_segment = running_time_sample / sps;
+
+        /* the segment currently read from the ringbuffer */
+        last_read_segment = sample / sps;
+
+        /* the skew we have between running_time and the ringbuffertime
+         * (last written to) */
+        segment_skew = running_time_segment - last_written_segment;
+
+        gint64 timestamp_diff = ABS(GST_CLOCK_DIFF (timestamp, base_time));
+        if (!first_sample && self->initial_timestamp_diff == 0) { // second sample
+          self->initial_timestamp_diff = timestamp_diff;
+        }
+
+        gint64 drift_ns = timestamp_diff > 0 ? ABS(self->initial_timestamp_diff - timestamp_diff) : 0; //nanoseconds
+        if (drift_ns > 50 * 1000000) { // 50ms
+          drift_correction = TRUE;
+          self->initial_timestamp_diff = 0;
+        }
+
+        GST_DEBUG_OBJECT (bsrc,
+            "\n running_time                                               = %"
+            GST_TIME_FORMAT
+            "\n timestamp                                                  = %"
+            GST_TIME_FORMAT
+            "\n initial_timestamp_diff                                     = %"
+            GST_TIME_FORMAT
+            "\n timestamp_diff                                             = %"
+            GST_TIME_FORMAT
+            "\n drift                                                      = %"
+            GST_TIME_FORMAT
+            "\n running_time_segment                                       = %d"
+            "\n last_written_segment                                       = %d"
+            "\n segment_skew (running time segment - last_written_segment) = %d"
+            "\n last_read_segment                                          = %d",
+            GST_TIME_ARGS (running_time), GST_TIME_ARGS (timestamp),
+            GST_TIME_ARGS (self->initial_timestamp_diff),
+            GST_TIME_ARGS (timestamp_diff),
+            GST_TIME_ARGS (drift_ns),
+            running_time_segment, last_written_segment, segment_skew,
+            last_read_segment);
+
+        if ((segment_skew >= ringbuffer->spec.segtotal) ||
+            (last_read_segment == 0) || first_sample ||
+            drift_correction) {
+          gint new_read_segment = running_time_segment;
+          gint segment_diff;
+          guint64 new_sample;
+
+          /* the difference between running_time and the last written segment */
+          segment_diff = running_time_segment - last_written_segment;
+
+          /* advance the ringbuffer, if we need to */
+          if (segment_diff != 0) {
+            gst_audio_ring_buffer_advance (ringbuffer, segment_diff);
+
+            /* we move the  new read segment to the last known written segment */
+            new_read_segment =
+              g_atomic_int_get (&ringbuffer->segdone) - ringbuffer->segbase;
+          }
+
+          /* we calculate the new sample value */
+          new_sample = ((guint64) new_read_segment) * sps;
+
+          /* and get the relative time to this -> our new timestamp */
+          timestamp = gst_util_uint64_scale_int (new_sample, GST_SECOND, rate);
+
+          /* we update the next sample accordingly */
+          src->next_sample = new_sample + samples;
+
+          GST_DEBUG_OBJECT (bsrc,
+              "Timeshifted the ringbuffer with %d segments: "
+              "Updating the timestamp to %" GST_TIME_FORMAT ", "
+              "and src->next_sample to %" G_GUINT64_FORMAT, segment_diff,
+              GST_TIME_ARGS (timestamp), src->next_sample);
+        }
+
+        break;
+      }
       case GST_AUDIO_BASE_SRC_SLAVE_SKEW:
       {
         GstClockTime running_time;

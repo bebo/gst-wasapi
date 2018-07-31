@@ -60,7 +60,9 @@ struct _GstWasapiSrc
   gsize overflow_buffer_size;
   guint overflow_buffer_ptr;
   guint overflow_buffer_length;
-  guint8 * overflow_buffer;
+  guint8 *overflow_buffer;
+
+  gint64 initial_timestamp_diff;
   /* Client was reset, so it needs to be started again */
   gboolean client_needs_restart;
 
