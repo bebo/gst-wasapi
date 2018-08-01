@@ -83,7 +83,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
 /* The clock provided by WASAPI is always off and causes buffers to be late
  * very quickly on the sink. Disable pending further investigation. */
 #define DEFAULT_PROVIDE_CLOCK FALSE
-#define DEFAULT_DRIFT_CORRECTION_THRESHOLD  50 * 100000 // 50ms
+#define DEFAULT_DRIFT_CORRECTION_THRESHOLD  50 * 1000000 // 50ms
 
 enum
 {
@@ -710,6 +710,11 @@ gst_wasapi_src_unprepare (GstAudioSrc * asrc)
     self->overflow_buffer_length = 0;
   }
 
+  GST_INFO("stats: drift_correction: %d, timeshifted: %d", self->drift_correction_count, self->timeshifted_count);
+
+  self->drift_correction_count = 0;
+  self->timeshifted_count = 0;
+
   CoUninitialize ();
 
   return TRUE;
@@ -1188,7 +1193,7 @@ gst_audio_base_src_create (GstBaseSrc * bsrc, guint64 offset, guint length,
          * (last written to) */
         segment_skew = running_time_segment - last_written_segment;
 
-        gint64 timestamp_diff = ABS(GST_CLOCK_DIFF (timestamp, base_time));
+        gint64 timestamp_diff = ABS(GST_CLOCK_DIFF (timestamp, running_time));
         if (!first_sample && self->initial_timestamp_diff == 0) { // second sample
           self->initial_timestamp_diff = timestamp_diff;
         }
