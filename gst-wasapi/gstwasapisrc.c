@@ -752,7 +752,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
           self->overflow_buffer_ptr = 0;
           self->overflow_buffer_length = 0;
       } else {
-          GST_WARNING_OBJECT(self, "WASAPI more in overflow that wanted");
+          GST_LOG_OBJECT(self, "WASAPI more in overflow that wanted");
           self->overflow_buffer_ptr += n;
           self->overflow_buffer_length -= n;
       }
