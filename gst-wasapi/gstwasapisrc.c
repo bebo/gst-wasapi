@@ -41,8 +41,9 @@
 #endif
 
 #include "gstwasapisrc.h"
-#include <avrt.h>
 
+#include <gst/gst.h>
+#include <avrt.h>
 #if defined(_MSC_VER)
 #include <functiondiscoverykeys_devpkey.h>
 #elif !defined(PKEY_Device_FriendlyName)
@@ -53,6 +54,18 @@ DEFINE_PROPERTYKEY (PKEY_Device_FriendlyName, 0xa45c254e, 0xdf1c, 0x4efd, 0x80,
 DEFINE_PROPERTYKEY (PKEY_AudioEngine_DeviceFormat, 0xf19f064d, 0x82c, 0x4e27,
     0xbc, 0x73, 0x68, 0x82, 0xa1, 0xbb, 0x8e, 0x4c, 0);
 #endif
+
+#define GETTEXT_PACKAGE gst-plugins-bebo
+#include "gst-i18n-plugin.h"
+
+#define GST_AUDIO_BASE_SRC_GET_PRIVATE(obj)  \
+   (G_TYPE_INSTANCE_GET_PRIVATE ((obj), GST_TYPE_AUDIO_BASE_SRC, GstAudioBaseSrcPrivate))
+
+struct _GstAudioBaseSrcPrivate
+{
+  /* the clock slaving algorithm in use */
+  GstAudioBaseSrcSlaveMethod slave_method;
+};
 
 GST_DEBUG_CATEGORY_STATIC (gst_wasapi_src_debug);
 #define GST_CAT_DEFAULT gst_wasapi_src_debug
@@ -70,6 +83,7 @@ static GstStaticPadTemplate src_template = GST_STATIC_PAD_TEMPLATE ("src",
 /* The clock provided by WASAPI is always off and causes buffers to be late
  * very quickly on the sink. Disable pending further investigation. */
 #define DEFAULT_PROVIDE_CLOCK FALSE
+#define DEFAULT_DRIFT_CORRECTION_THRESHOLD  50 * 1000000 // 50ms
 
 enum
 {
@@ -83,7 +97,13 @@ enum
   PROP_RESTART_REQUIRED,
   PROP_SAMPLE_RATE,
   PROP_DEVICE_DESCRIPTION,
+  PROP_TIMESHIFTED_COUNT,
+  PROP_DRIFT_CORRECTION_COUNT,
+  PROP_DRIFT_CORRECTION_THRESHOLD,
 };
+
+static GstFlowReturn gst_audio_base_src_create (GstBaseSrc * bsrc,
+    guint64 offset, guint length, GstBuffer ** buf);
 
 static void gst_wasapi_src_dispose (GObject * object);
 static void gst_wasapi_src_finalize (GObject * object);
@@ -124,6 +144,8 @@ gst_wasapi_src_class_init (GstWasapiSrcClass * klass)
   gobject_class->finalize = gst_wasapi_src_finalize;
   gobject_class->set_property = gst_wasapi_src_set_property;
   gobject_class->get_property = gst_wasapi_src_get_property;
+
+  gstbasesrc_class->create = GST_DEBUG_FUNCPTR (gst_audio_base_src_create);
 
   g_object_class_install_property (gobject_class,
       PROP_ROLE,
@@ -180,6 +202,25 @@ gst_wasapi_src_class_init (GstWasapiSrcClass * klass)
           "Friendly Name of device ",
           NULL, G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class,
+      PROP_TIMESHIFTED_COUNT,
+      g_param_spec_uint64("timeshifted-count", "Timeshifted buffer count",
+          "Number of buffer got timeshifted",
+          0, G_MAXUINT64, 0, G_PARAM_READABLE));
+
+  g_object_class_install_property (gobject_class,
+      PROP_DRIFT_CORRECTION_COUNT,
+      g_param_spec_uint64("drift-correction-count", "Drifted buffer count",
+          "Number of buffer that is difted more than drift correction threshold",
+          0, G_MAXUINT64, 0, G_PARAM_READABLE));
+
+  g_object_class_install_property (gobject_class,
+      PROP_DRIFT_CORRECTION_THRESHOLD,
+      g_param_spec_uint64("drift-correction-threshold", "Drifted buffer threshold (nanoseconds)",
+          "The threshold in nanoseconds for when we start correcting drifted buffers",
+          0, G_MAXUINT64, DEFAULT_DRIFT_CORRECTION_THRESHOLD,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gst_element_class_add_static_pad_template (gstelement_class, &src_template);
   gst_element_class_set_static_metadata (gstelement_class, "WasapiSrc",
       "Source/Audio",
@@ -229,6 +270,10 @@ gst_wasapi_src_init (GstWasapiSrc * self)
   self->client_needs_restart = FALSE;
   self->change_initialized = 0;
   self->eos_sent = FALSE;
+  self->initial_timestamp_diff = 0;
+  self->timeshifted_count = 0;
+  self->drift_correction_count = 0;
+  self->drift_correction_threshold = DEFAULT_DRIFT_CORRECTION_THRESHOLD;
   CoInitialize (NULL);
 }
 
@@ -323,6 +368,9 @@ gst_wasapi_src_set_property (GObject * object, guint prop_id,
     case PROP_AUDIOCLIENT3:
       self->try_audioclient3 = g_value_get_boolean (value);
       break;
+    case PROP_DRIFT_CORRECTION_THRESHOLD:
+      self->drift_correction_threshold = g_value_get_uint64 (value);
+      break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
       break;
@@ -364,6 +412,15 @@ gst_wasapi_src_get_property (GObject * object, guint prop_id,
       break;
     case PROP_DEVICE_DESCRIPTION:
       g_value_set_string (value, self->device_description);
+      break;
+    case PROP_TIMESHIFTED_COUNT:
+      g_value_set_uint64 (value, self->timeshifted_count);
+      break;
+    case PROP_DRIFT_CORRECTION_COUNT:
+      g_value_set_uint64 (value, self->drift_correction_count);
+      break;
+    case PROP_DRIFT_CORRECTION_THRESHOLD:
+      g_value_set_uint64 (value, self->drift_correction_threshold);
       break;
     default:
       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
@@ -653,6 +710,11 @@ gst_wasapi_src_unprepare (GstAudioSrc * asrc)
     self->overflow_buffer_length = 0;
   }
 
+  GST_INFO("stats: drift_correction: %d, timeshifted: %d", self->drift_correction_count, self->timeshifted_count);
+
+  self->drift_correction_count = 0;
+  self->timeshifted_count = 0;
+
   CoUninitialize ();
 
   return TRUE;
@@ -690,7 +752,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
           self->overflow_buffer_ptr = 0;
           self->overflow_buffer_length = 0;
       } else {
-          GST_WARNING_OBJECT(self, "WASAPI more in overflow that wanted");
+          GST_LOG_OBJECT(self, "WASAPI more in overflow that wanted");
           self->overflow_buffer_ptr += n;
           self->overflow_buffer_length -= n;
       }
@@ -907,3 +969,510 @@ gst_wasapi_src_get_time (GstClock * clock, gpointer user_data)
   return result;
 }
 #endif
+
+static guint64
+gst_audio_base_src_get_offset (GstAudioBaseSrc * src)
+{
+  guint64 sample;
+  gint readseg, segdone, segtotal, sps;
+  gint diff;
+
+  /* assume we can append to the previous sample */
+  sample = src->next_sample;
+
+  sps = src->ringbuffer->samples_per_seg;
+  segtotal = src->ringbuffer->spec.segtotal;
+
+  /* get the currently processed segment */
+  segdone = g_atomic_int_get (&src->ringbuffer->segdone)
+      - src->ringbuffer->segbase;
+
+  if (sample != -1) {
+    GST_DEBUG_OBJECT (src, "at segment %d and sample %" G_GUINT64_FORMAT,
+        segdone, sample);
+    /* figure out the segment and the offset inside the segment where
+     * the sample should be read from. */
+    readseg = sample / sps;
+
+    /* See how far away it is from the read segment. Normally, segdone (where
+     * new data is written in the ringbuffer) is bigger than readseg
+     * (where we are reading). */
+    diff = segdone - readseg;
+    if (diff >= segtotal) {
+      GST_DEBUG_OBJECT (src, "dropped, align to segment %d", segdone);
+      /* sample would be dropped, position to next playable position */
+      sample = ((guint64) (segdone)) * sps;
+    }
+  } else {
+    /* no previous sample, go to the current position */
+    GST_DEBUG_OBJECT (src, "first sample, align to current %d", segdone);
+    sample = ((guint64) (segdone)) * sps;
+    readseg = segdone;
+  }
+
+  GST_DEBUG_OBJECT (src,
+      "reading from %d, we are at %d, sample %" G_GUINT64_FORMAT, readseg,
+      segdone, sample);
+
+  return sample;
+}
+
+static GstFlowReturn
+gst_audio_base_src_create (GstBaseSrc * bsrc, guint64 offset, guint length,
+    GstBuffer ** outbuf)
+{
+  GstAudioBaseSrc *src = GST_AUDIO_BASE_SRC (bsrc);
+  GstWasapiSrc *self = GST_WASAPI_SRC (bsrc);
+  GstFlowReturn ret;
+  GstBuffer *buf;
+  GstMapInfo info;
+  guint8 *ptr;
+  guint samples, total_samples;
+  guint64 sample;
+  gint bpf, rate;
+  GstAudioRingBuffer *ringbuffer;
+  GstAudioRingBufferSpec *spec;
+  guint read;
+  GstClockTime timestamp, duration;
+  GstClockTime rb_timestamp = GST_CLOCK_TIME_NONE;
+  GstClock *clock;
+  gboolean first;
+  gboolean first_sample = src->next_sample == -1;
+
+  ringbuffer = src->ringbuffer;
+  spec = &ringbuffer->spec;
+
+  if (G_UNLIKELY (!gst_audio_ring_buffer_is_acquired (ringbuffer)))
+    goto wrong_state;
+
+  bpf = GST_AUDIO_INFO_BPF (&spec->info);
+  rate = GST_AUDIO_INFO_RATE (&spec->info);
+
+  if ((length == 0 && bsrc->blocksize == 0) || length == -1)
+    /* no length given, use the default segment size */
+    length = spec->segsize;
+  else
+    /* make sure we round down to an integral number of samples */
+    length -= length % bpf;
+
+  /* figure out the offset in the ringbuffer */
+  if (G_UNLIKELY (offset != -1)) {
+    sample = offset / bpf;
+    /* if a specific offset was given it must be the next sequential
+     * offset we expect or we fail for now. */
+    if (src->next_sample != -1 && sample != src->next_sample)
+      goto wrong_offset;
+  } else {
+    /* Calculate the sequentially-next sample we need to read. This can jump and
+     * create a DISCONT. */
+    sample = gst_audio_base_src_get_offset (src);
+  }
+
+  GST_DEBUG_OBJECT (src, "reading from sample %" G_GUINT64_FORMAT " length %u",
+      sample, length);
+
+  /* get the number of samples to read */
+  total_samples = samples = length / bpf;
+
+  /* use the basesrc allocation code to use bufferpools or custom allocators */
+  ret = GST_BASE_SRC_CLASS (parent_class)->alloc (bsrc, offset, length, &buf);
+  if (G_UNLIKELY (ret != GST_FLOW_OK))
+    goto alloc_failed;
+
+  gst_buffer_map (buf, &info, GST_MAP_WRITE);
+  ptr = info.data;
+  first = TRUE;
+  do {
+    GstClockTime tmp_ts = GST_CLOCK_TIME_NONE;
+
+    read =
+        gst_audio_ring_buffer_read (ringbuffer, sample, ptr, samples, &tmp_ts);
+    if (first && GST_CLOCK_TIME_IS_VALID (tmp_ts)) {
+      first = FALSE;
+      rb_timestamp = tmp_ts;
+    }
+    GST_DEBUG_OBJECT (src, "read %u of %u", read, samples);
+    /* if we read all, we're done */
+    if (read == samples)
+      break;
+
+    if (g_atomic_int_get (&ringbuffer->state) ==
+        GST_AUDIO_RING_BUFFER_STATE_ERROR)
+      goto got_error;
+
+    /* else something interrupted us and we wait for playing again. */
+    GST_DEBUG_OBJECT (src, "wait playing");
+    if (gst_base_src_wait_playing (bsrc) != GST_FLOW_OK)
+      goto stopped;
+
+    GST_DEBUG_OBJECT (src, "continue playing");
+
+    /* read next samples */
+    sample += read;
+    samples -= read;
+    ptr += read * bpf;
+  } while (TRUE);
+  gst_buffer_unmap (buf, &info);
+
+  /* mark discontinuity if needed */
+  if (G_UNLIKELY (sample != src->next_sample) && src->next_sample != -1) {
+    GST_WARNING_OBJECT (src,
+        "create DISCONT of %" G_GUINT64_FORMAT " samples at sample %"
+        G_GUINT64_FORMAT, sample - src->next_sample, sample);
+    GST_ELEMENT_WARNING (src, CORE, CLOCK,
+        (_("Can't record audio fast enough")),
+        ("Dropped %" G_GUINT64_FORMAT " samples. This is most likely because "
+            "downstream can't keep up and is consuming samples too slowly.",
+            sample - src->next_sample));
+    GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_DISCONT);
+  }
+
+  src->next_sample = sample + samples;
+
+  /* get the normal timestamp to get the duration. */
+  timestamp = gst_util_uint64_scale_int (sample, GST_SECOND, rate);
+  duration = gst_util_uint64_scale_int (src->next_sample, GST_SECOND,
+      rate) - timestamp;
+
+  GST_OBJECT_LOCK (src);
+  if (!(clock = GST_ELEMENT_CLOCK (src)))
+    goto no_sync;
+
+  if (!GST_CLOCK_TIME_IS_VALID (rb_timestamp) && clock != src->clock) {
+    /* we are slaved, check how to handle this */
+    switch (src->priv->slave_method) {
+      case GST_AUDIO_BASE_SRC_SLAVE_RESAMPLE:
+        /* Not implemented, use skew algorithm. This algorithm should
+         * work on the readout pointer and produce more or less samples based
+         * on the clock drift */
+      {
+        GstClockTime running_time;
+        GstClockTime base_time;
+        GstClockTime current_time;
+        guint64 running_time_sample;
+        gint running_time_segment;
+        gint last_read_segment;
+        gint segment_skew;
+        gint sps;
+        gint segments_written;
+        gint last_written_segment;
+        gboolean drift_correction = FALSE;
+
+        /* get the amount of segments written from the device by now */
+        segments_written = g_atomic_int_get (&ringbuffer->segdone);
+
+        /* subtract the base to segments_written to get the number of the
+         * last written segment in the ringbuffer
+         * (one segment written = segment 0) */
+        last_written_segment = segments_written - ringbuffer->segbase - 1;
+
+        /* samples per segment */
+        sps = ringbuffer->samples_per_seg;
+
+        /* get the current time */
+        current_time = gst_clock_get_time (clock);
+
+        /* get the basetime */
+        base_time = GST_ELEMENT_CAST (src)->base_time;
+
+        /* get the running_time */
+        running_time = current_time - base_time;
+
+        /* the running_time converted to a sample
+         * (relative to the ringbuffer) */
+        running_time_sample =
+            gst_util_uint64_scale_int (running_time, rate, GST_SECOND);
+
+        /* the segmentnr corresponding to running_time, round down */
+        running_time_segment = running_time_sample / sps;
+
+        /* the segment currently read from the ringbuffer */
+        last_read_segment = sample / sps;
+
+        /* the skew we have between running_time and the ringbuffertime
+         * (last written to) */
+        segment_skew = running_time_segment - last_written_segment;
+
+        gint64 timestamp_diff = ABS(GST_CLOCK_DIFF (timestamp, running_time));
+        if (!first_sample && self->initial_timestamp_diff == 0) { // second sample
+          self->initial_timestamp_diff = timestamp_diff;
+        }
+
+        gint64 drift_ns = timestamp_diff > 0 ? ABS(self->initial_timestamp_diff - timestamp_diff) : 0; //nanoseconds
+        if (drift_ns > self->drift_correction_threshold) {
+          drift_correction = TRUE;
+          self->initial_timestamp_diff = 0;
+          self->drift_correction_count++;
+        }
+
+        GST_DEBUG_OBJECT (bsrc,
+            "\n running_time                                               = %"
+            GST_TIME_FORMAT
+            "\n timestamp                                                  = %"
+            GST_TIME_FORMAT
+            "\n initial_timestamp_diff                                     = %"
+            GST_TIME_FORMAT
+            "\n timestamp_diff                                             = %"
+            GST_TIME_FORMAT
+            "\n drift                                                      = %"
+            GST_TIME_FORMAT
+            "\n running_time_segment                                       = %d"
+            "\n last_written_segment                                       = %d"
+            "\n segment_skew (running time segment - last_written_segment) = %d"
+            "\n last_read_segment                                          = %d",
+            GST_TIME_ARGS (running_time), GST_TIME_ARGS (timestamp),
+            GST_TIME_ARGS (self->initial_timestamp_diff),
+            GST_TIME_ARGS (timestamp_diff),
+            GST_TIME_ARGS (drift_ns),
+            running_time_segment, last_written_segment, segment_skew,
+            last_read_segment);
+
+        if ((segment_skew >= ringbuffer->spec.segtotal) ||
+            (last_read_segment == 0) || first_sample ||
+            drift_correction) {
+          gint new_read_segment = running_time_segment;
+          gint segment_diff;
+          guint64 new_sample;
+
+          /* the difference between running_time and the last written segment */
+          segment_diff = running_time_segment - last_written_segment;
+
+          /* advance the ringbuffer, if we need to */
+          if (segment_diff != 0) {
+            gst_audio_ring_buffer_advance (ringbuffer, segment_diff);
+
+            /* we move the  new read segment to the last known written segment */
+            new_read_segment =
+              g_atomic_int_get (&ringbuffer->segdone) - ringbuffer->segbase;
+          }
+
+          /* we calculate the new sample value */
+          new_sample = ((guint64) new_read_segment) * sps;
+
+          /* and get the relative time to this -> our new timestamp */
+          timestamp = gst_util_uint64_scale_int (new_sample, GST_SECOND, rate);
+
+          /* we update the next sample accordingly */
+          src->next_sample = new_sample + samples;
+
+          GST_DEBUG_OBJECT (bsrc,
+              "Timeshifted the ringbuffer with %d segments: "
+              "Updating the timestamp to %" GST_TIME_FORMAT ", "
+              "and src->next_sample to %" G_GUINT64_FORMAT, segment_diff,
+              GST_TIME_ARGS (timestamp), src->next_sample);
+
+          self->timeshifted_count++;
+        }
+        break;
+      }
+      case GST_AUDIO_BASE_SRC_SLAVE_SKEW:
+      {
+        GstClockTime running_time;
+        GstClockTime base_time;
+        GstClockTime current_time;
+        guint64 running_time_sample;
+        gint running_time_segment;
+        gint last_read_segment;
+        gint segment_skew;
+        gint sps;
+        gint segments_written;
+        gint last_written_segment;
+
+        /* get the amount of segments written from the device by now */
+        segments_written = g_atomic_int_get (&ringbuffer->segdone);
+
+        /* subtract the base to segments_written to get the number of the
+         * last written segment in the ringbuffer
+         * (one segment written = segment 0) */
+        last_written_segment = segments_written - ringbuffer->segbase - 1;
+
+        /* samples per segment */
+        sps = ringbuffer->samples_per_seg;
+
+        /* get the current time */
+        current_time = gst_clock_get_time (clock);
+
+        /* get the basetime */
+        base_time = GST_ELEMENT_CAST (src)->base_time;
+
+        /* get the running_time */
+        running_time = current_time - base_time;
+
+        /* the running_time converted to a sample
+         * (relative to the ringbuffer) */
+        running_time_sample =
+            gst_util_uint64_scale_int (running_time, rate, GST_SECOND);
+
+        /* the segmentnr corresponding to running_time, round down */
+        running_time_segment = running_time_sample / sps;
+
+        /* the segment currently read from the ringbuffer */
+        last_read_segment = sample / sps;
+
+        /* the skew we have between running_time and the ringbuffertime
+         * (last written to) */
+        segment_skew = running_time_segment - last_written_segment;
+
+        GST_DEBUG_OBJECT (bsrc,
+            "\n running_time                                              = %"
+            GST_TIME_FORMAT
+            "\n timestamp                                                  = %"
+            GST_TIME_FORMAT
+            "\n running_time_segment                                       = %d"
+            "\n last_written_segment                                       = %d"
+            "\n segment_skew (running time segment - last_written_segment) = %d"
+            "\n last_read_segment                                          = %d",
+            GST_TIME_ARGS (running_time), GST_TIME_ARGS (timestamp),
+            running_time_segment, last_written_segment, segment_skew,
+            last_read_segment);
+
+        /* Resync the ringbuffer if:
+         *
+         * 1. We are more than the length of the ringbuffer behind.
+         *    The length of the ringbuffer then gets to dictate
+         *    the threshold for what is considered "too late"
+         *
+         * 2. If this is our first buffer.
+         *    We know that we should catch up to running_time
+         *    the first time we are ran.
+         */
+        if ((segment_skew >= ringbuffer->spec.segtotal) ||
+            (last_read_segment == 0) || first_sample) {
+          gint new_read_segment;
+          gint segment_diff;
+          guint64 new_sample;
+
+          /* the difference between running_time and the last written segment */
+          segment_diff = running_time_segment - last_written_segment;
+
+          /* advance the ringbuffer */
+          gst_audio_ring_buffer_advance (ringbuffer, segment_diff);
+
+          /* we move the  new read segment to the last known written segment */
+          new_read_segment =
+              g_atomic_int_get (&ringbuffer->segdone) - ringbuffer->segbase;
+
+          /* we calculate the new sample value */
+          new_sample = ((guint64) new_read_segment) * sps;
+
+          /* and get the relative time to this -> our new timestamp */
+          timestamp = gst_util_uint64_scale_int (new_sample, GST_SECOND, rate);
+
+          /* we update the next sample accordingly */
+          src->next_sample = new_sample + samples;
+
+          GST_DEBUG_OBJECT (bsrc,
+              "Timeshifted the ringbuffer with %d segments: "
+              "Updating the timestamp to %" GST_TIME_FORMAT ", "
+              "and src->next_sample to %" G_GUINT64_FORMAT, segment_diff,
+              GST_TIME_ARGS (timestamp), src->next_sample);
+
+          self->timeshifted_count++;
+        }
+        break;
+      }
+      case GST_AUDIO_BASE_SRC_SLAVE_RE_TIMESTAMP:
+      {
+        GstClockTime base_time, latency;
+
+        /* We are slaved to another clock. Take running time of the pipeline
+         * clock and timestamp against it. Somebody else in the pipeline should
+         * figure out the clock drift. We keep the duration we calculated
+         * above. */
+        timestamp = gst_clock_get_time (clock);
+        base_time = GST_ELEMENT_CAST (src)->base_time;
+
+        if (GST_CLOCK_DIFF (timestamp, base_time) < 0)
+          timestamp -= base_time;
+        else
+          timestamp = 0;
+
+        /* subtract latency */
+        latency = gst_util_uint64_scale_int (total_samples, GST_SECOND, rate);
+        if (timestamp > latency)
+          timestamp -= latency;
+        else
+          timestamp = 0;
+      }
+      case GST_AUDIO_BASE_SRC_SLAVE_NONE:
+        break;
+    }
+  } else {
+    GstClockTime base_time;
+
+    if (GST_CLOCK_TIME_IS_VALID (rb_timestamp)) {
+      /* the read method returned a timestamp so we use this instead */
+      timestamp = rb_timestamp;
+    } else {
+      /* to get the timestamp against the clock we also need to add our
+       * offset */
+      timestamp = gst_audio_clock_adjust (GST_AUDIO_CLOCK (clock), timestamp);
+    }
+
+    /* we are not slaved, subtract base_time */
+    base_time = GST_ELEMENT_CAST (src)->base_time;
+
+    if (GST_CLOCK_DIFF (timestamp, base_time) < 0) {
+      timestamp -= base_time;
+      GST_LOG_OBJECT (src,
+          "buffer timestamp %" GST_TIME_FORMAT " (base_time %" GST_TIME_FORMAT
+          ")", GST_TIME_ARGS (timestamp), GST_TIME_ARGS (base_time));
+    } else {
+      GST_LOG_OBJECT (src,
+          "buffer timestamp 0, ts %" GST_TIME_FORMAT " <= base_time %"
+          GST_TIME_FORMAT, GST_TIME_ARGS (timestamp),
+          GST_TIME_ARGS (base_time));
+      timestamp = 0;
+    }
+  }
+
+no_sync:
+  GST_OBJECT_UNLOCK (src);
+
+  GST_BUFFER_TIMESTAMP (buf) = timestamp;
+  GST_BUFFER_DURATION (buf) = duration;
+  GST_BUFFER_OFFSET (buf) = sample;
+  GST_BUFFER_OFFSET_END (buf) = sample + samples;
+
+  *outbuf = buf;
+
+  GST_LOG_OBJECT (src, "Pushed buffer timestamp %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (GST_BUFFER_TIMESTAMP (buf)));
+
+  return GST_FLOW_OK;
+
+  /* ERRORS */
+wrong_state:
+  {
+    GST_DEBUG_OBJECT (src, "ringbuffer in wrong state");
+    return GST_FLOW_FLUSHING;
+  }
+wrong_offset:
+  {
+    GST_ELEMENT_ERROR (src, RESOURCE, SEEK,
+        (NULL), ("resource can only be operated on sequentially but offset %"
+            G_GUINT64_FORMAT " was given", offset));
+    return GST_FLOW_ERROR;
+  }
+alloc_failed:
+  {
+    GST_DEBUG_OBJECT (src, "alloc failed: %s", gst_flow_get_name (ret));
+    return ret;
+  }
+stopped:
+  {
+    gst_buffer_unmap (buf, &info);
+    gst_buffer_unref (buf);
+    GST_DEBUG_OBJECT (src, "ringbuffer stopped");
+    return GST_FLOW_FLUSHING;
+  }
+got_error:
+  {
+    gst_buffer_unmap (buf, &info);
+    gst_buffer_unref (buf);
+    GST_DEBUG_OBJECT (src, "ringbuffer was in error state, bailing out");
+    return GST_FLOW_ERROR;
+  }
+}
+
+
