@@ -809,7 +809,7 @@ gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data, guint length,
             goto beach;
         }
         if (i > 0) {
-            GST_INFO_OBJECT(self, "draining WASAPI buffer %i", i);
+            GST_LOG_OBJECT(self, "draining WASAPI buffer %i", i);
         }
         i++;
 
