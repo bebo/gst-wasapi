@@ -55,7 +55,6 @@ struct _GstWasapiSrc
   IAudioCaptureClient *capture_client;
   HANDLE event_handle;
   HANDLE stop_handle;
-  HANDLE thread_priority_handle;
 
   gsize overflow_buffer_size;
   guint overflow_buffer_ptr;
