@@ -91,7 +91,7 @@ static guint gst_wasapi_src_read (GstAudioSrc * asrc, gpointer data,
 static guint gst_wasapi_src_delay (GstAudioSrc * asrc);
 static void gst_wasapi_src_reset (GstAudioSrc * asrc);
 
-#ifdef DEFAULT_PROVIDE_CLOCK
+#if DEFAULT_PROVIDE_CLOCK
 static GstClockTime gst_wasapi_src_get_time (GstClock * clock,
     gpointer user_data);
 #endif
@@ -173,7 +173,7 @@ gst_wasapi_src_class_init (GstWasapiSrcClass * klass)
 static void
 gst_wasapi_src_init (GstWasapiSrc * self)
 {
-#ifdef DEFAULT_PROVIDE_CLOCK
+#if DEFAULT_PROVIDE_CLOCK
   /* override with a custom clock */
   if (GST_AUDIO_BASE_SRC (self)->clock)
     gst_object_unref (GST_AUDIO_BASE_SRC (self)->clock);
@@ -512,9 +512,6 @@ gst_wasapi_src_prepare (GstAudioSrc * asrc, GstAudioRingBufferSpec * spec)
   gst_audio_ring_buffer_set_channel_positions (GST_AUDIO_BASE_SRC
       (self)->ringbuffer, self->positions);
 
-  /* Increase the thread priority to reduce glitches */
-  self->thread_priority_handle = gst_wasapi_util_set_thread_characteristics ();
-
   res = TRUE;
 beach:
   /* unprepare() is not called if prepare() fails, but we want it to be, so call
@@ -529,12 +526,6 @@ static gboolean
 gst_wasapi_src_unprepare (GstAudioSrc * asrc)
 {
   GstWasapiSrc *self = GST_WASAPI_SRC (asrc);
-
-  if (self->thread_priority_handle != NULL) {
-    gst_wasapi_util_revert_thread_characteristics
-        (self->thread_priority_handle);
-    self->thread_priority_handle = NULL;
-  }
 
   if (self->client != NULL) {
     IAudioClient_Stop (self->client);
@@ -679,7 +670,7 @@ gst_wasapi_src_reset (GstAudioSrc * asrc)
   GST_OBJECT_UNLOCK (self);
 }
 
-#ifdef DEFAULT_PROVIDE_CLOCK
+#if DEFAULT_PROVIDE_CLOCK
 static GstClockTime
 gst_wasapi_src_get_time (GstClock * clock, gpointer user_data)
 {
